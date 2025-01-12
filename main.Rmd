@@ -40,7 +40,8 @@ library(arrow)
 # setup options
 tmap_mode("plot")
 
-# setup keys
+# setup keys, creating or editing .Renviron file as needed 
+# Guidance on .Renviron: https://laurenilano.com/posts/api-keys/#creating-the-.renviron-file
 census_api_key(Sys.getenv("CENSUS_KEY")) # get from https://api.census.gov/data/key_signup.html
 interline_token <- Sys.getenv("OSM_KEY") # for OSM extract from https://www.interline.io/osm/extracts/
 transitland_key <- Sys.getenv("TRANSITLAND_KEY") # to get GTFS feeds from Transitland (https://www.transit.land/terms)
