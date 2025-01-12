@@ -6,6 +6,8 @@ author:
     affiliation: University of Toronto
 ---
 
+Template source: https://github.com/higgicd/Accessibility_Toolbox/
+
 # ABSTRACT
 Analyses of place-based accessibility undertaken in the popular ArcGIS environment require many time-consuming and tedious steps. Moreover, questions persist over the selection of an impedance function and cost or cut-off parameters. In response, this paper details a new Accessibility Toolbox for R and ArcGIS that includes a Python tool for conducting accessibility analyses and an interactive R Notebook that enables the visualization and customization of impedance functions and parameters. Using this toolbox, researchers and practitioners can simplify their accessibility analysis workflow and make better decisions about the specification and customization of travel impedance for their study context.
 
