@@ -1,0 +1,6 @@
+.Rprofile
+.Rhistory
+data/*
+r5_graph/*
+r5_ttm/*
+rjavaenv/*

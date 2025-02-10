@@ -24,25 +24,28 @@ options(java.parameters = "-Xmx6G")
 # load packages
 library(corrplot)
 library(httr)
+library(jsonlite)
 library(knitr)
 library(lehdr)
+library(tigris)
 library(tidyverse)
 library(fs)
 library(r5r)
 library(sf)
+library(tmap)
 library(tidycensus)
 library(tidytransit)
-library(tmap)
 library(viridis)
 library(progress)
 library(arrow)
+library(duckdb)
 
 # setup options
 tmap_mode("plot")
 
 # setup keys, creating or editing .Renviron file as needed 
 # Guidance on .Renviron: https://laurenilano.com/posts/api-keys/#creating-the-.renviron-file
-census_api_key(Sys.getenv("CENSUS_KEY")) # get from https://api.census.gov/data/key_signup.html
+census_api_key(Sys.getenv("CENSUS_API_KEY")) # get from https://api.census.gov/data/key_signup.html
 interline_token <- Sys.getenv("OSM_KEY") # for OSM extract from https://www.interline.io/osm/extracts/
 transitland_key <- Sys.getenv("TRANSITLAND_KEY") # to get GTFS feeds from Transitland (https://www.transit.land/terms)
 
@@ -270,38 +273,26 @@ ggplot((t_ij), aes(t_ij)) +
   labs(title = "Figure 1. Impedance Function Comparison")
 ```
 
-Calculating place-based accessibility using the `R5R` package below requires the creation of a network dataset using data from Open Street Map (OSM) and General Transit Feed Specification (GTFS) files; input origins and destinations (point or polygon); a numerical attribute representing destination opportunities, and the selection of one or more of the 28 impedance functions implemented in the tool (Table 1) to weight the attractiveness of the opportunities. In addition to Kwan’s (1998) impedance specifications, the toolbox also implements Handy and Niemeier's (1997) negative exponential specification calibrated to walking trips for convenience shopping in Oakland, CA in 1980 and several additional popular cumulative rectangular measures.
+Calculating place-based accessibility using the `R5R` package below requires the creation of a network dataset using data from Open Street Map (OSM) and General Transit Feed Specification (GTFS) files; input origins and destinations (point or polygon); a numerical attribute representing destination opportunities, and the selection of one or more of the 28 impedance functions implemented in the tool to weight the attractiveness of the opportunities. In addition to Kwan’s (1998) impedance specifications, the toolbox also implements Handy and Niemeier's (1997) negative exponential specification calibrated to walking trips for convenience shopping in Oakland, CA in 1980 and several additional popular cumulative rectangular measures.
 
-```{r table1, echo=FALSE}
-table1 <- read.csv("./data/table1.csv")
-kable(table1, caption = "Table 1. Impedance Measures in the Accessibility Toolbox", col.names = c("Impedance<br/>Measure", "Impedance<br/>Parameter ", "<br/>Source"), escape = FALSE, format = "pandoc")
-```
-
-# DEMONSTRATION DATA: NEW YORK CITY
+# DATA PROCESSING: MBTA
 ## Download and Prepare Census Data
 
 ```{r load RData, echo = FALSE}
 # you can run the code below to download the data (remember your api keys!)
 # or load it pre-processed from here:
-load(file = path(data_path, "nyc_cb_poly.RData"))
+mbta_cb_poly <- readRDS(file.path(data_path, "mbta_cb_poly.rds"))
 ```
 
-The first step is to download the census data that will be used as indicators of opportunities. This includes downloading census population and employment data at the block level for New York City using the `tidycensus` and `lodes` packages respectively:
+The first step is to download the census data that will be used as indicators of opportunities, including census population and employment data at the block level using the `tigris` and `lodes` packages respectively.
 
-```{r download census population and employment data, include = FALSE, eval = FALSE}
-# download total population from the 2010 decennial census
-ny_pop <- get_decennial(geography = "block", 
-                        year = "2010", 
-                        variables = "P001001", 
-                        state = "NY", 
-                        county = c("061", "005", "047", "081", "085")) %>%
-  rename(Block_GEOID = GEOID, total_pop = value) %>%
-  mutate(Block_GEOID = as.character(Block_GEOID)) %>%
-  select(Block_GEOID, total_pop)
+```{r download census employment data, include = FALSE, eval = FALSE}
+# include all MA counties with year-round MBTA service
+mbta_counties = c("005", "009", "017", "021", "023", "025", "027")
 
 # download longitudinal origin-destination employment survey data
-ny_lodes <- grab_lodes(state = "ny", 
-                       year = 2010, 
+ma_lodes <- grab_lodes(state = "ma", 
+                       year = 2020, 
                        lodes_type = "wac", 
                        job_type = "JT00",
                        segment = "S000", 
@@ -315,58 +306,54 @@ ny_lodes <- grab_lodes(state = "ny",
 Next, download census block geographic boundaries from New York City's Open Data catalogue, prepare standardized GEOIDs for joining, and join the population and employment data:
 
 ```{r download and prepare census boundaries, include = FALSE, eval = FALSE}
-# download census block boundaries
-GET("https://data.cityofnewyork.us/api/geospatial/v2h8-6mxf?method=export&format=Original",
-    write_disk("./data/NYC_CensusBlocks.zip", overwrite=TRUE))
+# download census block boundaries, including their populations
+mbta_blkshp <- blocks("MA", mbta_counties, year=2020) %>% 
+  st_transform(crs = 26986) %>% # project to NAD 1983 Massachusetts mainland
+  mutate(Block_GEOID = GEOID20, total_pop = POP20, geometry=geometry, .keep='none')
 
-# unzip
-unzip(zipfile = "./data/NYC_CensusBlocks.zip", exdir = "./data")
-
-# load census blocks poly
-nyc_cb_poly <- st_read(dir_ls(path = data_path, regexp  = "nycb2010.shp$", recurse = TRUE)) %>% 
-  st_transform(crs = 26918) %>% # project to NAD 1983 Zone 18N
+# generate census blocks poly
+mbta_cb_poly <- mbta_blkshp %>% 
   
-  # create and set GEOID fields: see https://www.census.gov/programs-surveys/geography/guidance/geo-identifiers.html
-  mutate(StateCode = "36", # create StateCode
-         CountyCode = case_when(BoroCode == "1" ~ "061", # create CountyCode
-                                BoroCode == "2" ~ "005",
-                                BoroCode == "3" ~ "047",
-                                BoroCode == "4" ~ "081",
-                                BoroCode == "5" ~ "085"),
-         BlockGroup = substr(CB2010, 1, 1)) %>% # create a BlockGroup code from first digit of Block ID
-  
-  # unite into a block geoid
-  unite(Block_GEOID, c(StateCode, CountyCode, CT2010, CB2010), sep = "") %>% 
-  
-  # join population and employment
-  left_join(ny_pop, by = "Block_GEOID") %>%
-  left_join(ny_lodes, by = "Block_GEOID") %>%
+  # join employment
+  left_join(ma_lodes, by = "Block_GEOID") %>%
   
   # zero-out any NAs
   mutate(total_pop = ifelse(is.na(total_pop), 0, total_pop),
          total_emp = ifelse(is.na(total_emp), 0, total_emp))
+
+# save census blocks poly
+mbta_cb_poly %>% saveRDS(path(data_path, "mbta_cb_poly.rds"))
 ```
 
 ## Download Travel Network Data
 
-With the census data prepared, the second step is to download the travel network data. This consists of an extract of Open Street Map (OSM) data from [interline.io](https://www.interline.io/osm/extracts/):
+With the census data prepared, the second step is to download the travel network data. This consists of an extract of Open Street Map (OSM) data from [geofabrik](https://download.geofabrik.de/):
 
 ```{r download osm, include=FALSE, eval = FALSE}
-# Download OpenStreetMap data for the NYC metro area from Interline map extracts
-download.file(url = paste0("https://app.interline.io/osm_extracts/download_latest?string_id=new-york_new-york&data_format=pbf&api_token=", interline_token),
+# Download OpenStreetMap data for the state of Massachusetts from Geofabrik
+download.file(url = "https://download.geofabrik.de/north-america/us/massachusetts-latest.osm.pbf",
               destfile = file.path(r5_path, "osm.pbf"), mode = "wb")
 ```
 
-And General Transit Feed Specification (GTFS) files for New York City:
+And extract General Transit Feed Specification (GTFS) files from [Transitland](https://www.transit.land/documentation/rest-api):
 
 ```{r download gtfs, include = FALSE, eval = FALSE}
-# I have included a gtfs package that matches the analysis datetime in the r5_graph folder. You can download a new one with this code:
-# Download GTFS files for regional transit providers
-download.file(url = "http://web.mta.info/developers/data/nyct/subway/google_transit.zip", 
-              destfile = file.path(r5_path, "nyct_subway.zip"), mode = "wb")
+# transitland also has a feeds api that allows bounding box searches for feeds, but
+# at first glance, it will also include a lot of stuff we care less about, like peter pan buses
+
+mbta_req <- request("https://transit.land/api/v2/rest/feeds/f-drt-mbta/download_latest_feed_version") %>%
+  req_headers(apikey = transitland_key)
+mbta_resp <- req_perform(mbta_req)
+mbta_resp %>%
+  resp_body_raw() %>%
+  brio::write_file_raw(path=file.path(r5_path, "mbta_recent.zip"))
+
+# TODO: pending transitland correspondence, maybe replace them with Mobility Database
 ```
 
-This sample analysis focuses on the New York City subway only, but other GTFS files for commuter rail and bus service can easily be added.
+Or extract General Transit Feed Specification (GTFS) files from [Mobility Database](https://mobilitydatabase.org/feeds):
+
+We can download other GTFS feeds to the same location to analyze additional services.
 
 ```{r extra gtfs packages, include = FALSE, eval = FALSE}
 # for bus and commuter rail you can add these by un-commenting the code
@@ -388,12 +375,266 @@ This sample analysis focuses on the New York City subway only, but other GTFS fi
 #              destfile = file.path(r5_path, "nyc_busco.zip"), mode = "wb")
 ```
 
+```{r mbta gtfs}
+mbta_feed_index <- read.csv('https://cdn.mbta.com/archive/archived_feeds.txt')
+
+date_start <- "2024-10-29"
+date_end <- "2025-02-01"
+
+# get list of dates for selected days of week before and after 12/15/2025
+dtrange <- seq(as.Date(date_start), as.Date(date_end), by="days")
+tuesdays <- dtrange[weekdays(dtrange) == 'Tuesday'] %>% format('%Y%m%d') %>% as.integer()
+saturdays <- dtrange[weekdays(dtrange) == 'Saturday'] %>% format('%Y%m%d') %>% as.integer()
+
+# only downloads the feed for a given date if that feed is not already present in data_path
+lookup_mbta_feed_from_date <- function(yyyymmdd) {
+  feed_url <- mbta_feed_index[mbta_feed_index$feed_start_date <= yyyymmdd 
+                         & mbta_feed_index$feed_end_date >= yyyymmdd,'archive_url']
+  fname <- sub(".*/", "", feed_url)
+  
+  if (!file.exists(file.path(data_path, fname))) {
+    download.file(url = feed_url,
+              destfile = file.path(data_path, fname), mode = "wb")
+  }
+  lookup <- list()
+  lookup[[as.character(yyyymmdd)]] <- fname
+  return(lookup)
+}
+
+feed_list <- function(dates) {
+  feed_lookup <- list()
+  
+  for (dt in dates) {
+    feed_lookup <- c(feed_lookup, lookup_mbta_feed_from_date(dt))
+  }
+  
+  return(feed_lookup)
+}
+
+mbta_tues_lookup <- feed_list(tuesdays)
+mbta_sat_lookup <- feed_list(saturdays)
+
+# To actually run them in r5 though, each feed has to be moved one at a time into r5_path and the r5 core set up with overwrite=TRUE. The travel time matrix outputs should also now be saved in a series of folders per agency, date, and time
+```
+
 We can query the characteristics of the subway GTFS data using the `summary.gtfs()` function from the `tidytransit` package:
 
-```{r echo = FALSE}
-nyc_subway_gtfs <- read_gtfs(path = file.path(r5_path, "nyct_subway.zip"))
+```{r}
+run_duckdb <- function(query) {
+  con <- dbConnect(duckdb()) # set up duckdb connection
+  
+  # load httpfs extension to query URL sources
+  dbExecute(con, "INSTALL httpfs;")
+  dbExecute(con, "LOAD httpfs;")
+  
+  # Execute the query and fetch results
+  result <- dbGetQuery(con, query)
+  
+  # Disconnect from DuckDB
+  dbDisconnect(con, shutdown = TRUE)
+  
+  return(result)
+}
+```
 
-summary(nyc_subway_gtfs)
+```{r}
+mbta_gtfs_metrics <- function(date_start, date_end, year) {
+  gtfs_metrics_query <- paste0("
+      -- First, assemble the list of all days between the specified start and end dates, using YYYYMMDD format
+      with service_days as (
+        select 
+          strftime(generate_series, '%Y%m%d')::INTEGER as service_day
+          , date_part('weekday', generate_series) as dow
+        from generate_series(timestamp '", date_start, "', timestamp '", date_end, "', interval '1 day')
+      ),
+      
+      -- Then, get all the IDs of the scheduled on each day, making sure to
+      -- incorporate both typical and 'exception' service (e.g. holidays, diversions)
+      services_scheduled as (
+        SELECT 
+              service_day
+              , service_id
+        FROM service_days
+        JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/calendar.parquet') AS c
+          ON end_date >= service_day AND start_date <= service_day
+          AND c.gtfs_end_date >= service_day AND c.gtfs_active_date <= service_day
+          AND CASE
+            WHEN dow = 0 and sunday = 1 then 1
+            WHEN dow = 1 and monday = 1 then 1
+            WHEN dow = 2 and tuesday = 1 then 1
+            WHEN dow = 3 and wednesday = 1 then 1
+            WHEN dow = 4 and thursday = 1 then 1
+            WHEN dow = 5 and friday = 1 then 1
+            WHEN dow = 6 and saturday = 1 then 1
+            ELSE 0 END = 1
+            
+        -- exception_type = 2 are days when a given service was removed from the schedule
+        ANTI JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/calendar_dates.parquet') AS cd
+          ON c.service_id = cd.service_id AND cd.exception_type = 2 and cd.date = service_day
+          
+        -- exception_type = 1 represents days when a given service was added to the schedule
+        UNION 
+        SELECT 
+              service_day
+              , service_id
+        FROM service_days
+        JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/calendar_dates.parquet') AS cd
+          ON cd.exception_type = 1 and cd.date = service_day
+      ),
+      
+      -- get trip durations for all scheduled services on each day
+      trip_info AS (
+        SELECT 
+              service_day
+              , st.trip_id
+              , t.route_id
+              , r.route_desc
+              , min(arrival_time) as trip_start
+              , max(arrival_time) as trip_end
+              , 60*datepart('hour', max(departure_time)::INTERVAL - min(arrival_time)::INTERVAL)
+                + datepart('minute', max(departure_time)::INTERVAL - min(arrival_time)::INTERVAL) as trip_duration_minutes
+        FROM services_scheduled ss
+        JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/calendar_attributes.parquet') AS ca
+          ON ss.service_id = ca.service_id AND ca.gtfs_end_date >= service_day AND ca.gtfs_active_date <= service_day
+        JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/trips.parquet') AS t
+          ON ss.service_id = t.service_id AND t.gtfs_end_date >= service_day AND t.gtfs_active_date <= service_day
+        JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/stop_times.parquet') AS st
+          ON st.trip_id = t.trip_id AND st.gtfs_end_date >= service_day AND st.gtfs_active_date <= service_day
+        JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/routes.parquet') AS r
+          ON t.route_id = r.route_id AND r.gtfs_end_date >= service_day AND r.gtfs_active_date <= service_day
+        GROUP BY 1,2,3,4
+      ),
+      
+      -- deduplicate trip IDs with same start and end times on same routes and days
+      trips_unique AS (
+        SELECT DISTINCT
+          service_day
+          , route_id
+          , route_desc
+          , trip_start
+          , trip_end
+          , trip_duration_minutes
+        FROM trip_info
+      )
+  
+      SELECT
+        service_day
+        , route_id
+        , route_desc
+        , count(*) as num_trips
+        , sum(trip_duration_minutes) as total_runtime_minutes
+        , min(trip_start) as first_trip_start
+        , max(trip_end) as last_trip_end
+      FROM trips_unique
+      GROUP BY 1,2,3;
+    ")
+  
+  return(run_duckdb(gtfs_metrics_query))
+}
+```
+
+```{r}
+mbta_gtfs_metrics_between <- function(date_start, date_end) {
+  yyyymmdd_st <- as.integer(strftime(strptime(date_start, '%Y-%m-%d'), '%Y%m%d'))
+  yyyymmdd_end <- as.integer(strftime(strptime(date_end, '%Y-%m-%d'), '%Y%m%d'))
+  yyyy_st <- as.integer(yyyymmdd_st/10000)
+  yyyy_end <- as.integer(yyyymmdd_end/10000)
+  
+  df <- data.frame()
+  
+  for (yyyy in yyyy_st:yyyy_end) {
+    dt_st <- strftime(strptime(max(yyyy*10000+101, yyyymmdd_st), '%Y%m%d'), '%Y-%m-%d')
+    dt_end <- strftime(strptime(min(yyyy*10000+1231, yyyymmdd_end), '%Y%m%d'), '%Y-%m-%d')
+    
+    df <- bind_rows(df, mbta_gtfs_metrics(dt_st, dt_end, yyyy))
+  }
+
+  return(df)
+}
+```
+
+```{r}
+gtfs_metrics <- mbta_gtfs_metrics_between(date_start, date_end)
+```
+
+```{r}
+gtfs_metrics %>%
+  filter(service_day %in% tuesdays, route_id == '86') %>%
+  arrange(service_day) %>%
+  head(15)
+```
+
+```{r}
+year <- 2024
+test_query <- paste0("
+    -- First, assemble the list of all days between the specified start and end dates, using YYYYMMDD format
+    with service_days as (
+      select 
+        strftime(generate_series, '%Y%m%d')::INTEGER as service_day
+        , date_part('weekday', generate_series) as dow
+      from generate_series(timestamp '", date_start, "', timestamp '", date_end, "', interval '1 day')
+    ),
+    
+    -- Then, get all the IDs of the scheduled on each day, making sure to
+    -- incorporate both typical and 'exception' service (e.g. holidays, diversions)
+    services_scheduled as (
+      SELECT 
+            service_day
+            , service_id
+      FROM service_days
+      JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/calendar.parquet') AS c
+        ON end_date >= service_day AND start_date <= service_day
+        AND c.gtfs_end_date >= service_day AND c.gtfs_active_date <= service_day
+        AND CASE
+          WHEN dow = 0 and sunday = 1 then 1
+          WHEN dow = 1 and monday = 1 then 1
+          WHEN dow = 2 and tuesday = 1 then 1
+          WHEN dow = 3 and wednesday = 1 then 1
+          WHEN dow = 4 and thursday = 1 then 1
+          WHEN dow = 5 and friday = 1 then 1
+          WHEN dow = 6 and saturday = 1 then 1
+          ELSE 0 END = 1
+          
+      -- exception_type = 2 are days when a given service was removed from the schedule
+      ANTI JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/calendar_dates.parquet') AS cd
+        ON c.service_id = cd.service_id AND cd.exception_type = 2 and cd.date = service_day
+        
+      -- exception_type = 1 represents days when a given service was added to the schedule
+      UNION 
+      SELECT 
+            service_day
+            , service_id
+      FROM service_days
+      JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/calendar_dates.parquet') AS cd
+        ON cd.exception_type = 1 and cd.date = service_day
+    )
+    
+
+      SELECT 
+            service_day
+            , ca.service_id
+            , ca.service_schedule_typicality
+            , st.trip_id
+            , t.route_id
+            , r.route_desc
+            , min(arrival_time) as trip_start
+            , max(arrival_time) as trip_end
+            , 60*datepart('hour', max(departure_time)::INTERVAL - min(arrival_time)::INTERVAL)
+              + datepart('minute', max(departure_time)::INTERVAL - min(arrival_time)::INTERVAL) as trip_duration_minutes
+      FROM services_scheduled ss
+      JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/calendar_attributes.parquet') AS ca
+        ON ss.service_id = ca.service_id AND ca.gtfs_end_date >= service_day AND ca.gtfs_active_date <= service_day
+      JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/trips.parquet') AS t
+        ON ss.service_id = t.service_id AND t.gtfs_end_date >= service_day AND t.gtfs_active_date <= service_day
+      JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/stop_times.parquet') AS st
+        ON st.trip_id = t.trip_id AND st.gtfs_end_date >= service_day AND st.gtfs_active_date <= service_day
+      JOIN read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/routes.parquet') AS r
+        ON t.route_id = r.route_id AND r.gtfs_end_date >= service_day AND r.gtfs_active_date <= service_day
+      WHERE r.route_id = '66'
+      GROUP BY 1,2,3,4,5,6;
+  ")
+  
+t <- run_duckdb(test_query)
 ```
 
 This is useful for ascertaining the service dates contained within the GTFS calendar. Take note of the calendar range, as you will have to specify a date and time that falls within this interval when running the origin-destination matrix calculation below.
@@ -407,11 +648,11 @@ In addition, a `chunk_size` parameter is used to control batching as the base `t
 ```{r define parameters, warning = FALSE}
 # 1. Generalize calls to input simple features
 # origins
-origins_i <-  nyc_cb_poly
+origins_i <-  mbta_cb_poly
 origins_id_field <- "Block_GEOID"
 
 # destinations
-destinations_j <-  nyc_cb_poly
+destinations_j <-  mbta_cb_poly
 destinations_id_field <- "Block_GEOID"
 opportunities_j_field <- "total_emp"
 
@@ -446,12 +687,9 @@ mode <- c("WALK", "TRANSIT")
 #max_lts = 2 # The maximum level of traffic stress that cyclists will tolerate. A value of 1 means cyclists will only travel through the quietest streets, while a value of 4 indicates cyclists can travel through any road; defaults to 2
 
 # define trip start datetime
-departure_datetime <- as.POSIXct("2021-05-04 08:00:00",  # must be within calendar range of gtfs 
+departure_datetime <- as.POSIXct("2025-01-29 08:00:00",  # must be within calendar range of gtfs 
                                  format = "%Y-%m-%d %H:%M:%S", 
                                  tz = "America/New_York") # see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones for list of time zone codes
-
-# maximum walk distance (in metres)
-max_walk_dist = 4000
 
 # max trip duration (minutes)
 max_trip_duration = 45
@@ -513,6 +751,8 @@ opportunities_j <- destinations_j %>%
 
 Third, the origin-destination matrix is calculated in accordance with the travel and batching parameters set earlier. In this case, I have set the ODCM to save to disk as a parquet dataset, which is a great format for compressed storage and for larger-than-memory calculations. Because the travel time matrix is stored on disk already, I have set this chunk to `eval = FALSE`.
 
+TODO: use time_window and percentiles parameters as described here: https://ipeagit.github.io/r5r/articles/time_window.html 
+
 ```{r calculate od matrix, echo = FALSE, eval = FALSE}
 # set up batching 
 num_chunks = origins_i %>% st_drop_geometry() %>% summarize(num_chunks = max(batch_id)) %>% pull(num_chunks)
@@ -530,7 +770,6 @@ for (i in 1:num_chunks){
     destinations = destinations_j,
     mode = mode,
     departure_datetime = departure_datetime,
-    max_walk_dist = max_walk_dist,
     max_trip_duration = max_trip_duration,
     verbose = FALSE,
     progress = FALSE) %>%
@@ -550,34 +789,23 @@ print(paste0("OD matrix calculation took ", round(difftime(end.time, start.time,
 
 Finally, accessibilities are calculated using the selected impedance function(s) by iterating over all the batches of the origin-destination matrix. There's a few ways of doing this.
 
+TODO: use accessibility package to aggregate opportunities accessible from a ttm as shown here: https://cran.r-project.org/web/packages/r5r/vignettes/accessibility.html
+
 ### Arrow
 
 The first way to do this is straightforward using `arrow`: calculate over the whole dataset using a single function, one-by-one. This makes use of the larger-than-memory processing capabilities of `arrow`. However, core math functions like `exp()` are not yet implemented for dataset calculations (they should be in version 9). So that does not work at the moment. `arrow` does also not appear to play well with defined functions, so one has to put them all in manually, like so:
 
 ```{r calculate accessibility using arrow, echo = FALSE}
-ttm <- open_dataset(path(ttm_path))
-
-accessibility <- ttm %>%
-  
-  # join opportunities
-  left_join(opportunities_j, by = "toId") %>%
-  
-  # mutate
-  mutate(POW2_0 = o_j * case_when(travel_time < 1 ~ 1, TRUE ~ travel_time^-2),
-         EXP0_15 = o_j *  2.71828^(-0.15*travel_time),
-         MGAUS180 = o_j * 2.71828^(-travel_time^2/180),
-         CUMR40 = o_j * case_when(travel_time <= 40 ~ 1, TRUE ~ 0),
-         CUML40 = o_j * case_when(travel_time <= 40 ~ 1-travel_time/40, TRUE ~ 0)) %>%
-  
-  # summarize results
-  group_by(fromId) %>%
-  summarize(POW2_0 = sum(POW2_0),
-            EXP0_15 = sum(EXP0_15),
-            MGAUS180 = sum(MGAUS180),
-            CUMR40 = sum(CUMR40),
-            CUML40 = sum(CUML40)) %>%
-  
+ttm <- open_dataset(path(ttm_path)) %>%
+  # insert accessibility functions here?
   collect()
+```
+
+terminate r5r instance to clear up memory
+
+```{r}
+r5r::stop_r5(r5r_core)
+rJava::.jgc(R.gc = TRUE)
 ```
 
 This works well with one or a few selected functions, but does not scale well to using many functions.
