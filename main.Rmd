@@ -67,7 +67,7 @@ Despite several decades of research into place-based accessibility, researchers,
 
 To promote a more "accessible" solution for accessibility analyses, this paper details a new Accessibility Toolbox for R and ArcGIS. The Python toolbox for ArcGIS simplifies the steps involved in a place-based accessibility workflow and comes coded with 5 impedance functions and 28 impedance measures for accessibility calculation. The interactive R Notebook version of this paper visualizes the function families and specifications and allows users to customize their parameters in accordance with theory and experience with their study area. These parameters can then be implemented in the ArcGIS tool’s Python code.
 
-# METHODS
+# IMPEDANCE FUNCTIONS
 The accessibility toolbox implements the five different impedance functions from Kwan (1998):
 
 $$
@@ -375,49 +375,7 @@ We can download other GTFS feeds to the same location to analyze additional serv
 #              destfile = file.path(r5_path, "nyc_busco.zip"), mode = "wb")
 ```
 
-## MBTA GTFS processing
-
-```{r mbta gtfs}
-mbta_feed_index <- read.csv('https://cdn.mbta.com/archive/archived_feeds.txt')
-
-date_start <- "2024-10-29"
-date_end <- "2025-02-01"
-
-# get list of dates for selected days of week before and after 12/15/2025
-dtrange <- seq(as.Date(date_start), as.Date(date_end), by="days")
-tuesdays <- dtrange[weekdays(dtrange) == 'Tuesday'] %>% format('%Y%m%d') %>% as.integer()
-saturdays <- dtrange[weekdays(dtrange) == 'Saturday'] %>% format('%Y%m%d') %>% as.integer()
-
-# only downloads the feed for a given date if that feed is not already present in data_path
-lookup_mbta_feed_from_date <- function(yyyymmdd) {
-  feed_url <- mbta_feed_index[mbta_feed_index$feed_start_date <= yyyymmdd 
-                         & mbta_feed_index$feed_end_date >= yyyymmdd,'archive_url']
-  fname <- sub(".*/", "", feed_url)
-  
-  if (!file.exists(file.path(data_path, fname))) {
-    download.file(url = feed_url,
-              destfile = file.path(data_path, fname), mode = "wb")
-  }
-  lookup <- list()
-  lookup[[as.character(yyyymmdd)]] <- fname
-  return(lookup)
-}
-
-feed_list <- function(dates) {
-  feed_lookup <- list()
-  
-  for (dt in dates) {
-    feed_lookup <- c(feed_lookup, lookup_mbta_feed_from_date(dt))
-  }
-  
-  return(feed_lookup)
-}
-
-mbta_tues_lookup <- feed_list(tuesdays)
-mbta_sat_lookup <- feed_list(saturdays)
-
-# To actually run them in r5 though, each feed has to be moved one at a time into r5_path and the r5 core set up with overwrite=TRUE. The travel time matrix outputs should also now be saved in a series of folders per agency, date, and time
-```
+## MBTA GTFS metrics from LAMP
 
 ```{r}
 run_duckdb <- function(query) {
@@ -600,6 +558,50 @@ gtfs_metrics %>%
   write.csv(path(data_path, "mbta_gtfs_metrics_route.csv"), row.names=FALSE)
 ```
 
+## MBTA GTFS full feeds
+
+```{r mbta gtfs}
+mbta_feed_index <- read.csv('https://cdn.mbta.com/archive/archived_feeds.txt')
+
+date_start <- "2024-10-29"
+date_end <- "2025-02-01"
+
+# get list of dates for selected days of week before and after 12/15/2025
+dtrange <- seq(as.Date(date_start), as.Date(date_end), by="days")
+tuesdays <- dtrange[weekdays(dtrange) == 'Tuesday'] %>% format('%Y%m%d') %>% as.integer()
+saturdays <- dtrange[weekdays(dtrange) == 'Saturday'] %>% format('%Y%m%d') %>% as.integer()
+
+# only downloads the feed for a given date if that feed is not already present in data_path
+lookup_mbta_feed_from_date <- function(yyyymmdd) {
+  feed_url <- mbta_feed_index[mbta_feed_index$feed_start_date <= yyyymmdd 
+                         & mbta_feed_index$feed_end_date >= yyyymmdd,'archive_url']
+  fname <- sub(".*/", "", feed_url)
+  
+  if (!file.exists(file.path(data_path, fname))) {
+    download.file(url = feed_url,
+              destfile = file.path(data_path, fname), mode = "wb")
+  }
+  lookup <- list()
+  lookup[[as.character(yyyymmdd)]] <- fname
+  return(lookup)
+}
+
+feed_list <- function(dates) {
+  feed_lookup <- list()
+  
+  for (dt in dates) {
+    feed_lookup <- c(feed_lookup, lookup_mbta_feed_from_date(dt))
+  }
+  
+  return(feed_lookup)
+}
+
+mbta_tues_lookup <- feed_list(tuesdays)
+mbta_sat_lookup <- feed_list(saturdays)
+
+# To actually run them in r5 though, each feed has to be moved one at a time into r5_path and the r5 core set up with overwrite=TRUE. The travel time matrix outputs should also now be saved in a series of folders per agency, date, and time
+```
+
 ```{r}
 gtfs_metrics <- read.csv(path(data_path, "mbta_gtfs_metrics_route.csv"))
 ```
@@ -629,10 +631,25 @@ gtfs_metrics %>%
   summarise(across(c(num_trips, total_runtime_minutes, total_runtime_km), sum), .groups='drop') %>%
   ggplot(aes(fill=route_category, y=total_runtime_minutes, x=service_dt)) + 
     geom_bar(position="stack", stat="identity") + 
-    ggtitle("Total MBTA Runtime by Route Category (Tuesdays, 2019-present)")
+    ggtitle("Total Scheduled MBTA Runtime by Route Category (Tuesdays, 2019-present)")
 ```
 
+Identify service days with suspiciously low total runtimes
 
+```{r}
+gtfs_metrics %>%
+  mutate(service_dt = as.POSIXct(strptime(as.character(service_day), '%Y%m%d'))) %>%
+  filter(weekdays(service_dt) == 'Tuesday', year(service_dt) >= 2019) %>%
+  group_by(service_dt) %>%
+  summarise(total_runtime_minutes_day = sum(total_runtime_minutes)) %>%
+  filter(total_runtime_minutes_day < 300000) %>%
+  select(service_dt) %>% unique()
+```
+
+TODO: function summarizing route-level changes in service between two dates. Validation examples: 
+
+https://www.reddit.com/r/mbta/comments/znq2l2/this_winter_the_mbta_has_cut_and_reduced_service/?rdt=59724 
+https://www.reddit.com/r/mbta/comments/11n00vr/mbta_to_cut_spring_2023_weekday_service_on_the/
 
 ```{r}
 year <- 2024
@@ -682,9 +699,6 @@ destinations_j <-  mbta_cb_poly
 destinations_id_field <- "Block_GEOID"
 opportunities_j_field <- "total_emp"
 
-# select your impedance functions
-selected_f <- c("POW2_0", "EXP0_15", "MGAUS180", "CUML40", "CUMR40") # pick one or more impedance functions
-
 # 2. R5 Travel Time Matrix Options. See https://rdrr.io/cran/r5r/man/travel_time_matrix.html for more detail
 # R5 allows for multiple combinations of transport modes. The options include:
 ## Transit modes
@@ -712,10 +726,8 @@ mode <- c("WALK", "TRANSIT")
 # level of traffic stress (cycling)
 #max_lts = 2 # The maximum level of traffic stress that cyclists will tolerate. A value of 1 means cyclists will only travel through the quietest streets, while a value of 4 indicates cyclists can travel through any road; defaults to 2
 
-# define trip start datetime
-departure_datetime <- as.POSIXct("2025-01-29 08:00:00",  # must be within calendar range of gtfs 
-                                 format = "%Y-%m-%d %H:%M:%S", 
-                                 tz = "America/New_York") # see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones for list of time zone codes
+# set the time of day for the departure (date will be set later)
+departure_time_hms <- "08:00:00"
 
 # max trip duration (minutes)
 max_trip_duration = 45
@@ -731,22 +743,11 @@ n_threads = Inf # The number of threads to use in parallel computing; defaults t
 
 With the input data collected and parameters set, the next step is to calculate accessibility. This occurs over three steps: first, building the network for routing with R5; second, preparing the input data into a format that R5 expects; third, calculating the origin-destination matrix; and fourth, calculating and summarizing accessibility for the selected impedance functions. Everything is generalized/automated after this point - just click run!
 
-## Set Up R5 Routing
-
-First, the network graph will be created.
-
-```{r build graph, include = FALSE}
-r5r_core <- setup_r5(data_path = r5_path, verbose = FALSE)
-```
-
 ## Prepare Input Data for Analysis
 
 Second, the input data are converted to centroids and transformed to the WGS 1984 geographic coordinate system. To save computational time, only destinations with opportunities are considered. 
 
 ```{r prepare input data for r5r, warning = FALSE, include = FALSE}
-# assemble all impedance functions into a list
-impedance_f <- c(POW, NEG_EXP, MGAUS, CUMR, CUML)
-
 # ORIGINS
 # create input sf object and change to crs 4326 for origins
 origins_i_sf <- origins_i %>% 
@@ -773,42 +774,86 @@ opportunities_j <- destinations_j %>%
   rename(toId = id)
 ```
 
-## Calculate Origin-Destination Matrix
+## Calculate Origin-Destination Travel Time Matrix
 
 Third, the origin-destination matrix is calculated in accordance with the travel and batching parameters set earlier. In this case, I have set the ODCM to save to disk as a parquet dataset, which is a great format for compressed storage and for larger-than-memory calculations. Because the travel time matrix is stored on disk already, I have set this chunk to `eval = FALSE`.
+
+```{r}
+# loop through lookup and get feed_day (name) and feed_curr (value)
+# name the ttm after the feed day, since different days on the same feed could (?) be different
+for (i in 1:length(mbta_tues_lookup)) {
+  feed_day <- names(mbta_tues_lookup)[[i]]
+  feed_curr <- mbta_tues_lookup[[i]]
+  
+  # move the current feed into the r5 path from the data path
+  file_move(path(data_path, feed_curr), path(r5_path, feed_curr))
+  
+  # create the network graph using the new GTFS feed
+  r5r_core <- setup_r5(data_path = r5_path, verbose = FALSE, overwrite=TRUE)
+  
+  ttm_path_curr <- dir_create(paste0("./r5_ttm/", feed_day))
+  
+  # define trip start datetime
+  departure_datetime <- as.POSIXct(
+    paste(strftime(strptime(feed_day, '%Y%m%d'), '%Y-%m-%d'), departure_time_hms), 
+    format = "%Y-%m-%d %H:%M:%S", tz = "America/New_York") 
+  # see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones for list of time zone codes
+  
+  # set up batching 
+  num_chunks = origins_i %>% st_drop_geometry() %>% summarize(num_chunks = max(batch_id)) %>% pull(num_chunks)
+  
+  # compute travel time matrix
+  start.time <- Sys.time()
+  pb <- txtProgressBar(0, num_chunks, style = 3)
+  
+  for (i in 1:num_chunks){
+    origins_i_chunk <- origins_i %>% filter(batch_id == i)
+    
+    ttm_chunk <- travel_time_matrix(
+      r5r_core = r5r_core,
+      origins = origins_i_chunk,
+      destinations = destinations_j,
+      mode = mode,
+      departure_datetime = departure_datetime,
+      max_trip_duration = max_trip_duration,
+      verbose = FALSE,
+      progress = FALSE,
+      time_window = 30,
+      percentiles = c(15, 30, 50, 70, 85)
+      ) %>%
+      
+    mutate(batch_id = i)
+    
+    # export output as parquet
+    write_dataset(ttm_chunk, path = ttm_path_curr, partitioning = "batch_id")
+    
+    setTxtProgressBar(pb, i)}
+  
+  end.time <- Sys.time()
+  print(paste0(
+    "OD matrix calculation took ", 
+    round(difftime(end.time, start.time, units = "mins"), digits = 2), " minutes..."
+    ))
+  
+  # to wrap up, we move the current feed out of the r5 path...
+  file_move(path(r5_path, feed_curr), path(data_path, feed_curr))
+  
+  # ...and terminate the r5r instance to clear memory
+  r5r::stop_r5(r5r_core)
+  rJava::.jgc(R.gc = TRUE)
+}
+```
+
+Then, we (re)create the network graph using the new GTFS feed.
+
+```{r build graph, include = FALSE}
+
+```
 
 TODO: use time_window and percentiles parameters as described here: https://ipeagit.github.io/r5r/articles/time_window.html 
 
 ```{r calculate od matrix, echo = FALSE, eval = FALSE}
-# set up batching 
-num_chunks = origins_i %>% st_drop_geometry() %>% summarize(num_chunks = max(batch_id)) %>% pull(num_chunks)
 
-# compute travel time matrix
-start.time <- Sys.time()
-pb <- txtProgressBar(0, num_chunks, style = 3)
-
-for (i in 1:num_chunks){
-  origins_i_chunk <- origins_i %>% filter(batch_id == i)
-  
-  ttm_chunk <- travel_time_matrix(
-    r5r_core = r5r_core,
-    origins = origins_i_chunk,
-    destinations = destinations_j,
-    mode = mode,
-    departure_datetime = departure_datetime,
-    max_trip_duration = max_trip_duration,
-    verbose = FALSE,
-    progress = FALSE) %>%
-    
-  mutate(batch_id = i)
-  
-  # export output as parquet
-  write_dataset(ttm_chunk, path = ttm_path, partitioning = "batch_id")
-  
-  setTxtProgressBar(pb, i)}
-
-end.time <- Sys.time()
-print(paste0("OD matrix calculation took ", round(difftime(end.time, start.time, units = "mins"), digits = 2), " minutes..."))
 ```
 
 ## Calculate and Summarize Accessibility
@@ -830,8 +875,7 @@ ttm <- open_dataset(path(ttm_path)) %>%
 terminate r5r instance to clear up memory
 
 ```{r}
-r5r::stop_r5(r5r_core)
-rJava::.jgc(R.gc = TRUE)
+
 ```
 
 This works well with one or a few selected functions, but does not scale well to using many functions.
@@ -841,6 +885,12 @@ This works well with one or a few selected functions, but does not scale well to
 The second option is to use the `map_batches` functionality in `arrow` to map a function to the individual dataset batches. This is because `dplyr` verbs such as `across` are not yet implemented in `arrow`, so the batch must first be brought into memory. However, in my testing with large travel time matrices, `map_batches` as used below can result in very high memory usage. Running this code on the saved `ttm` dataset uses many gigabytes of memory on my PC, so I believe this solution is **not stable**. As they note on the [website](https://arrow.apache.org/docs/r/articles/dataset.html): `map_batches` is experimental and not recommended for production use. I will keep this code for now to revisit in the future as the `arrow` package matures.
 
 ```{r calculate accessibility with map_batches, echo = FALSE, eval = FALSE}
+# # assemble all impedance functions into a list
+# impedance_f <- c(POW, NEG_EXP, MGAUS, CUMR, CUML)
+
+# # select your impedance functions
+# selected_f <- c("POW2_0", "EXP0_15", "MGAUS180", "CUML40", "CUMR40") # pick one or more impedance functions
+
 #ttm <- open_dataset(path(ttm_path))
 
 #accessibility <- ttm %>%
