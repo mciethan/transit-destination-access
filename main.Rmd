@@ -39,6 +39,7 @@ library(viridis)
 library(progress)
 library(arrow)
 library(duckdb)
+library(accessibility)
 
 # setup options
 tmap_mode("plot")
@@ -726,11 +727,17 @@ mode <- c("WALK", "TRANSIT")
 # level of traffic stress (cycling)
 #max_lts = 2 # The maximum level of traffic stress that cyclists will tolerate. A value of 1 means cyclists will only travel through the quietest streets, while a value of 4 indicates cyclists can travel through any road; defaults to 2
 
+# max trip duration (minutes)
+max_trip_duration = 45
+
 # set the time of day for the departure (date will be set later)
 departure_time_hms <- "08:00:00"
 
-# max trip duration (minutes)
-max_trip_duration = 45
+# # of minutes starting from departure_time_hms within which to consider trip starts
+time_window_minutes <- 30 
+
+# travel time percentiles of the above time window (e.g., 85% of trips took X min or less)
+time_window_percentiles <- c(15, 30, 50, 70, 85) 
 
 # processing batch size - how many origin rows to process at one time
 chunksize = 500 # how many origins to consider at one time; set to nrow(origins_sf) if you don't want to use
@@ -818,8 +825,8 @@ for (i in 1:length(mbta_tues_lookup)) {
       max_trip_duration = max_trip_duration,
       verbose = FALSE,
       progress = FALSE,
-      time_window = 30,
-      percentiles = c(15, 30, 50, 70, 85)
+      time_window = time_window_minutes, 
+      percentiles = time_window_percentiles
       ) %>%
       
     mutate(batch_id = i)
@@ -844,38 +851,63 @@ for (i in 1:length(mbta_tues_lookup)) {
 }
 ```
 
-Then, we (re)create the network graph using the new GTFS feed.
-
-```{r build graph, include = FALSE}
-
-```
-
-TODO: use time_window and percentiles parameters as described here: https://ipeagit.github.io/r5r/articles/time_window.html 
-
-```{r calculate od matrix, echo = FALSE, eval = FALSE}
-
-```
-
 ## Calculate and Summarize Accessibility
 
 Finally, accessibilities are calculated using the selected impedance function(s) by iterating over all the batches of the origin-destination matrix. There's a few ways of doing this.
 
-TODO: use accessibility package to aggregate opportunities accessible from a ttm as shown here: https://cran.r-project.org/web/packages/r5r/vignettes/accessibility.html
+TODO: try generating some of the accessibility outputs shown here: https://cran.r-project.org/web/packages/r5r/vignettes/accessibility.html
+
+TODO: parameterize ttm_path
+TODO: decide on data storage for access datasets
+maybe /outputs -> (optional layers for agency, metric type, etc) -> csv per feed day?
+
+The visualization I think I want next is a line chart with shaded areas representing the high and low percentage bounds of accessibility and dates on the x axis. To do that, I need to calculate accessibility from each ttm and then aggregate that, starting with just the population average or median but likely expanding to a bunch of different metrics at some point (grabbing a set of accessibility percentiles - distinct from within-window percentiles, grouping by population, calculating gini / palma / concentration indices for inequality, etc). There's also the calculation of before/after changes in access per block, but that kind of visualization will be limited to just examples since we're interested in lots of little changes. 
+
+How can I measure if a schedule change makes the time-of-day percentiles less variable? Because what if there are changes for some people, but not for the median person? A given block could see higher accessibility levels but the same, smaller, or greater range of time-of-day accessibility values, either in absolute terms or relative to its level. That may be another example map worth creating, but for this study again I'll need to abstract or aggregate that a bit more. Probably at first just by calculating the population average for each time-of-day percentile and then comparing the spreads over time. 
+
+I'm realizing that there is a large rabbit hole of possible metrics here, even in this, my initial test run. 
 
 ### Arrow
 
 The first way to do this is straightforward using `arrow`: calculate over the whole dataset using a single function, one-by-one. This makes use of the larger-than-memory processing capabilities of `arrow`. However, core math functions like `exp()` are not yet implemented for dataset calculations (they should be in version 9). So that does not work at the moment. `arrow` does also not appear to play well with defined functions, so one has to put them all in manually, like so:
 
-```{r calculate accessibility using arrow, echo = FALSE}
-ttm <- open_dataset(path(ttm_path)) %>%
-  # insert accessibility functions here?
-  collect()
+```{r}
+lud <- origins_i %>%
+  rename(id = all_of(origins_id_field))
+
+time_window_pctile_cols <- time_window_percentiles %>% 
+  as.character() %>% 
+  lapply(function(n) paste0('travel_time_p', n)) %>% 
+  unlist()
 ```
 
-terminate r5r instance to clear up memory
+```{r calculate accessibility using arrow, echo = FALSE}
+ttm_from_day <- function(feed_day) {
+  open_dataset(path(paste0(ttm_path, '/', as.character(feed_day)))) %>%
+    collect()
+}
 
-```{r}
+axs_at_pctile <- function(pctile_suffix, tt_matrix) {
+  tt_matrix %>%
+    cumulative_cutoff(
+      land_use_data = lud, opportunity = 'total_emp',
+      travel_cost = paste0('travel_time', pctile_suffix), 
+      cutoff=max_trip_duration
+    ) %>%
+    rename_with(~paste0('total_emp', pctile_suffix), total_emp)
+}
 
+axs_window_percentiles <- function(tt_matrix) {
+  '_p' %>% # create suffixes from global variable time_window_percentiles
+    paste0(time_window_percentiles %>% as.character()) %>%
+    # then calculate the access at each time window percentile for the given ttm
+    lapply(function(p) axs_at_pctile(p, tt_matrix)) %>%
+    reduce(inner_join, by='id') # and join the results
+}
+
+axs_lookup <- names(mbta_tues_lookup) %>%
+  lapply(ttm_from_day) %>% 
+  lapply(axs_window_percentiles)
 ```
 
 This works well with one or a few selected functions, but does not scale well to using many functions.
@@ -939,14 +971,6 @@ accessibility <- purrr::map_dfr(pq_files, function(batch){
     summarize(across(all_of(selected_f), sum))
 })
 ```  
-
-### Accessibility through R5R
-
-As of a recent update, the R5R package itself can calculate accessibility natively. Compared to the manual workflow of calculating the travel time matrix followed by accessibility, this function does it all in one step. The impedance functions and their specifications do not align with the focus of this paper though.
-
-```{r}
-?r5r::accessibility
-```
 
 ### Accessibility through the Upcoming Accessibility Package
 
