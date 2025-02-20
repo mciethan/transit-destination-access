@@ -51,7 +51,8 @@ interline_token <- Sys.getenv("OSM_KEY") # for OSM extract from https://www.inte
 transitland_key <- Sys.getenv("TRANSITLAND_KEY") # to get GTFS feeds from Transitland (https://www.transit.land/terms)
 
 # create data directories (does not overwrite if these folders are already present)
-data_path <- dir_create("./data") # for storing data
+data_path <- dir_create("./data") # for storing input data
+outputs_path <- dir_create("./outputs") # for storing output data
 ttm_path <- dir_create("./r5_ttm") # for storing od matrix
 r5_path <- dir_create("./r5_graph") # for the r5 network graph
 ```
@@ -279,12 +280,6 @@ Calculating place-based accessibility using the `R5R` package below requires the
 # DATA PROCESSING: MBTA
 ## Download and Prepare Census Data
 
-```{r load RData, echo = FALSE}
-# you can run the code below to download the data (remember your api keys!)
-# or load it pre-processed from here:
-mbta_cb_poly <- readRDS(file.path(data_path, "mbta_cb_poly.rds"))
-```
-
 The first step is to download the census data that will be used as indicators of opportunities, including census population and employment data at the block level using the `tigris` and `lodes` packages respectively.
 
 ```{r download census employment data, include = FALSE, eval = FALSE}
@@ -376,7 +371,7 @@ We can download other GTFS feeds to the same location to analyze additional serv
 #              destfile = file.path(r5_path, "nyc_busco.zip"), mode = "wb")
 ```
 
-## MBTA GTFS metrics from LAMP
+## Pull MBTA GTFS metrics from LAMP
 
 ```{r}
 run_duckdb <- function(query) {
@@ -559,7 +554,7 @@ gtfs_metrics %>%
   write.csv(path(data_path, "mbta_gtfs_metrics_route.csv"), row.names=FALSE)
 ```
 
-## MBTA GTFS full feeds
+## Pull MBTA GTFS full feeds / Create Feed Lookups
 
 ```{r mbta gtfs}
 mbta_feed_index <- read.csv('https://cdn.mbta.com/archive/archived_feeds.txt')
@@ -599,9 +594,9 @@ feed_list <- function(dates) {
 
 mbta_tues_lookup <- feed_list(tuesdays)
 mbta_sat_lookup <- feed_list(saturdays)
-
-# To actually run them in r5 though, each feed has to be moved one at a time into r5_path and the r5 core set up with overwrite=TRUE. The travel time matrix outputs should also now be saved in a series of folders per agency, date, and time
 ```
+
+## Explore MBTA GTFS metrics
 
 ```{r}
 gtfs_metrics <- read.csv(path(data_path, "mbta_gtfs_metrics_route.csv"))
@@ -683,11 +678,18 @@ t <- run_duckdb(test_query)
 
 This is useful for ascertaining the service dates contained within the GTFS calendar. Take note of the calendar range, as you will have to specify a date and time that falls within this interval when running the origin-destination matrix calculation below.
 
-## Define Accessibility Parameters
+# Accessibility Calculations
+
+## Define Parameters and Prepare Data
 
 Using this set of variable definitions, users can set the key parameters that define how the origin-destination matrix and accessibilities are calculated. This includes supplying the input origins and destinations (as `sf` objects), defining relevant ID and destination opportunities fields, and selecting one or more impedance functions, travel modes, a date and time of departure (within the calendar dates of the supplied GTFS files), and maximum walking distance and trip duration.
 
 In addition, a `chunk_size` parameter is used to control batching as the base `travel_time_matrix` function from `R5R` is employed here within a batching work flow built around `disk.frame`. In this formulation, the matrix is calculated for batches of origins to all destinations reachable within the travel time window for the selected modes. While `r5r`` works fastest with a single set of origins, this batching is implemented to save memory and enable the calculation of very large matrices. In addition, the resulting matrix is compressed and saved to disk for future use. Depending on your particular hardware configuration, you can change the number of origins considered in each batch.
+
+```{r}
+# load in pre-processed census data:
+mbta_cb_poly <- readRDS(file.path(data_path, "mbta_cb_poly.rds"))
+```
 
 ```{r define parameters, warning = FALSE}
 # 1. Generalize calls to input simple features
@@ -746,14 +748,6 @@ chunksize = 500 # how many origins to consider at one time; set to nrow(origins_
 n_threads = Inf # The number of threads to use in parallel computing; defaults to use all available threads (Inf)
 ```
 
-# Calculate Accessibility
-
-With the input data collected and parameters set, the next step is to calculate accessibility. This occurs over three steps: first, building the network for routing with R5; second, preparing the input data into a format that R5 expects; third, calculating the origin-destination matrix; and fourth, calculating and summarizing accessibility for the selected impedance functions. Everything is generalized/automated after this point - just click run!
-
-## Prepare Input Data for Analysis
-
-Second, the input data are converted to centroids and transformed to the WGS 1984 geographic coordinate system. To save computational time, only destinations with opportunities are considered. 
-
 ```{r prepare input data for r5r, warning = FALSE, include = FALSE}
 # ORIGINS
 # create input sf object and change to crs 4326 for origins
@@ -781,9 +775,9 @@ opportunities_j <- destinations_j %>%
   rename(toId = id)
 ```
 
-## Calculate Origin-Destination Travel Time Matrix
+## Calculate Origin-Destination Travel Time Matrices
 
-Third, the origin-destination matrix is calculated in accordance with the travel and batching parameters set earlier. In this case, I have set the ODCM to save to disk as a parquet dataset, which is a great format for compressed storage and for larger-than-memory calculations. Because the travel time matrix is stored on disk already, I have set this chunk to `eval = FALSE`.
+Third, an origin-destination matrix is calculated for each service date in accordance with the travel and batching parameters set earlier. In this case, I have set the ODCM to save to disk as a parquet dataset, which is a great format for compressed storage and for larger-than-memory calculations. This process took about 35 minutes per date for MBTA blocks (n=~80k).
 
 ```{r}
 # loop through lookup and get feed_day (name) and feed_curr (value)
@@ -867,12 +861,8 @@ How can I measure if a schedule change makes the time-of-day percentiles less va
 
 I'm realizing that there is a large rabbit hole of possible metrics here, even in this, my initial test run. 
 
-### Arrow
-
-The first way to do this is straightforward using `arrow`: calculate over the whole dataset using a single function, one-by-one. This makes use of the larger-than-memory processing capabilities of `arrow`. However, core math functions like `exp()` are not yet implemented for dataset calculations (they should be in version 9). So that does not work at the moment. `arrow` does also not appear to play well with defined functions, so one has to put them all in manually, like so:
-
 ```{r}
-lud <- origins_i %>%
+lud <- mbta_cb_poly %>%
   rename(id = all_of(origins_id_field))
 
 time_window_pctile_cols <- time_window_percentiles %>% 
@@ -882,7 +872,7 @@ time_window_pctile_cols <- time_window_percentiles %>%
 ```
 
 ```{r calculate accessibility using arrow, echo = FALSE}
-ttm_from_day <- function(feed_day) {
+read_ttm_from_day <- function(feed_day) {
   open_dataset(path(paste0(ttm_path, '/', as.character(feed_day)))) %>%
     collect()
 }
@@ -904,77 +894,76 @@ axs_window_percentiles <- function(tt_matrix) {
     lapply(function(p) axs_at_pctile(p, tt_matrix)) %>%
     reduce(inner_join, by='id') # and join the results
 }
-
-axs_lookup <- names(mbta_tues_lookup) %>%
-  lapply(ttm_from_day) %>% 
-  lapply(axs_window_percentiles)
 ```
 
-This works well with one or a few selected functions, but does not scale well to using many functions.
+Read the travel time matrices for a set of dates and calculate accessibility per percentile. This cell took ~90s per date for MBTA blocks (n=~80k).  
 
-### Mapping Batches with Arrow
-
-The second option is to use the `map_batches` functionality in `arrow` to map a function to the individual dataset batches. This is because `dplyr` verbs such as `across` are not yet implemented in `arrow`, so the batch must first be brought into memory. However, in my testing with large travel time matrices, `map_batches` as used below can result in very high memory usage. Running this code on the saved `ttm` dataset uses many gigabytes of memory on my PC, so I believe this solution is **not stable**. As they note on the [website](https://arrow.apache.org/docs/r/articles/dataset.html): `map_batches` is experimental and not recommended for production use. I will keep this code for now to revisit in the future as the `arrow` package matures.
-
-```{r calculate accessibility with map_batches, echo = FALSE, eval = FALSE}
-# # assemble all impedance functions into a list
-# impedance_f <- c(POW, NEG_EXP, MGAUS, CUMR, CUML)
-
-# # select your impedance functions
-# selected_f <- c("POW2_0", "EXP0_15", "MGAUS180", "CUML40", "CUMR40") # pick one or more impedance functions
-
-#ttm <- open_dataset(path(ttm_path))
-
-#accessibility <- ttm %>%
+```{r}
+for (feed_day in names(mbta_tues_lookup)) {
+  feed_day_str <- as.character(feed_day)
   
-#  map_batches(function(batch) {
-#    batch %>%
-#      as.data.frame() %>%
-      
-      # join opportunities
-#      left_join(opportunities_j, by = "toId") %>%
-      
-      # mutate across the selected functions
-#      mutate(across(travel_time, .fns= impedance_f[selected_f], .names = "{fn}")) %>%
-   
-      # multiply weights by opportunities
-#      mutate(across(all_of(selected_f), .fns = function(f) f*.$o_j)) %>%
-      
-      # summarize results
-#      group_by(fromId) %>% 
-#      summarize(across(all_of(selected_f), sum))
-#  })
-```  
-
-### Mapping Batches Manually
-
-A third way that does scale well for calculating results for all functions is to map batches manually by getting a list of all the `.parquet` files in the dataset and iterate over them. This works, but is not as clean as a pure `arrow` solution. I include it below for completeness.
-
-```{r calculate accessibility with purrr, echo = FALSE, eval = FALSE}
-pq_files <- dir_ls(path(ttm_path), glob = "*.parquet", recurse = TRUE)
-
-accessibility <- purrr::map_dfr(pq_files, function(batch){
-  access <- read_parquet(batch) %>% 
+  open_dataset(path(paste0(ttm_path, '/', feed_day_str))) %>%
     collect() %>%
-    
-    # join opportunities
-    left_join(opportunities_j, by = "toId") %>%
-    
-    # mutate across the selected functions
-    mutate(across(travel_time, .fns= impedance_f[selected_f], .names = "{fn}")) %>%
- 
-    # multiply weights by opportunities
-    mutate(across(all_of(selected_f), .fns = function(f) f*.$o_j)) %>%
-    
-    # summarize results
-    group_by(fromId) %>% 
-    summarize(across(all_of(selected_f), sum))
-})
-```  
+    axs_window_percentiles() %>%
+    mutate(service_day = feed_day) %>%
+    write.csv(
+      path(outputs_path, paste0(feed_day_str, ".csv")), 
+      row.names=F
+    )
+}
 
-### Accessibility through the Upcoming Accessibility Package
+# for (feed_day in names(mbta_tues_lookup)) {
+#   feed_day_str <- as.character(feed_day)
+#   
+#   df <- read.csv(path(outputs_path, paste0(feed_day_str, ".csv")))
+#   df %>%
+#     mutate(service_day = feed_day) %>%
+#     write.csv(
+#       path(outputs_path, paste0(feed_day_str, ".csv")), 
+#       row.names=F
+#     )
+# }
 
-The core aspects of place-based accessibility analysis have become significantly more "accessible" since I started working on this toolbox in 2019. The team behind `R5R` at the Institute for Applied Economic Research (Ipea) in Brazil is working on a new `accessibility` [package](https://github.com/ipeaGIT/accessibility) for R that will offer these functions and more within an easy-to-use R package. For most R users, this package will likely supersede the more manual approach adopted by this tutorial when it becomes available. Nevertheless, the workflows in this document are likely to continue to have a place for large analyses.
+axs_dfs <- names(mbta_tues_lookup) %>%
+  lapply(function(fd) read.csv(path(outputs_path, paste0(as.character(fd), ".csv"))))
+```
+
+```{r}
+block_pops <- mbta_cb_poly %>%
+  st_drop_geometry() %>%
+  rename(id = all_of(origins_id_field)) %>%
+  mutate(id = as.numeric(id)) %>%
+  select(id, total_pop)
+
+aggregate_axs <- function(df) {
+  df %>% 
+    inner_join(block_pops, by='id') %>%
+    group_by(service_day) %>%
+    summarise(
+      across(total_emp_p15:total_emp_p85, ~ weighted.mean(.x, total_pop)),
+      .groups='drop'
+      )
+}
+```
+
+```{r}
+axs_dfs %>%
+  lapply(aggregate_axs) %>%
+  bind_rows() %>%
+  mutate(service_date = as.POSIXct(strptime(as.character(service_day), '%Y%m%d'))) %>%
+  ggplot(aes(x=service_date, y=total_emp_p50)) +
+  geom_line(aes(x=service_date, y=total_emp_p50)) +
+  geom_ribbon(
+    aes(x=service_date, y=total_emp_p50, ymax=total_emp_p15, ymin=total_emp_p85), 
+    alpha=0.2) +
+  lims(y=c(0,100000)) +
+  labs(
+    title="Job Accessibility via Transit for Average MBTA-Area Resident, 11/2024 to 02/2025",
+    y = "Jobs Accessible via Transit & Walking within 45 Minutes", x="Tuesdays"
+  )
+  
+```
+
 
 # FINDINGS
 

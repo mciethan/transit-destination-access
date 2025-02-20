@@ -1,6 +1,7 @@
 .Rprofile
 .Rhistory
 data/*
+outputs/*
 r5_graph/*
 r5_ttm/*
 rjavaenv/*
