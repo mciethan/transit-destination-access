@@ -554,48 +554,6 @@ gtfs_metrics %>%
   write.csv(path(data_path, "mbta_gtfs_metrics_route.csv"), row.names=FALSE)
 ```
 
-## Pull MBTA GTFS full feeds / Create Feed Lookups
-
-```{r mbta gtfs}
-mbta_feed_index <- read.csv('https://cdn.mbta.com/archive/archived_feeds.txt')
-
-date_start <- "2024-10-29"
-date_end <- "2025-02-01"
-
-# get list of dates for selected days of week before and after 12/15/2025
-dtrange <- seq(as.Date(date_start), as.Date(date_end), by="days")
-tuesdays <- dtrange[weekdays(dtrange) == 'Tuesday'] %>% format('%Y%m%d') %>% as.integer()
-saturdays <- dtrange[weekdays(dtrange) == 'Saturday'] %>% format('%Y%m%d') %>% as.integer()
-
-# only downloads the feed for a given date if that feed is not already present in data_path
-lookup_mbta_feed_from_date <- function(yyyymmdd) {
-  feed_url <- mbta_feed_index[mbta_feed_index$feed_start_date <= yyyymmdd 
-                         & mbta_feed_index$feed_end_date >= yyyymmdd,'archive_url']
-  fname <- sub(".*/", "", feed_url)
-  
-  if (!file.exists(file.path(data_path, fname))) {
-    download.file(url = feed_url,
-              destfile = file.path(data_path, fname), mode = "wb")
-  }
-  lookup <- list()
-  lookup[[as.character(yyyymmdd)]] <- fname
-  return(lookup)
-}
-
-feed_list <- function(dates) {
-  feed_lookup <- list()
-  
-  for (dt in dates) {
-    feed_lookup <- c(feed_lookup, lookup_mbta_feed_from_date(dt))
-  }
-  
-  return(feed_lookup)
-}
-
-mbta_tues_lookup <- feed_list(tuesdays)
-mbta_sat_lookup <- feed_list(saturdays)
-```
-
 ## Explore MBTA GTFS metrics
 
 ```{r}
@@ -610,6 +568,7 @@ gtfs_metrics %>%
 ```
 
 ```{r}
+yyyy <- 2023
 gtfs_metrics %>%
   mutate(
     service_dt = as.POSIXct(strptime(as.character(service_day), '%Y%m%d')),
@@ -622,12 +581,13 @@ gtfs_metrics %>%
       levels=c('Rail Replacement Bus', 'Rapid Transit', 'Regional Rail', 'Ferry', 'Frequent Bus', 'Other Bus')
     )
     ) %>%
-  filter(weekdays(service_dt) == 'Tuesday', year(service_dt) >= 2019) %>%
+  filter(weekdays(service_dt) == 'Tuesday', year(service_dt) >= yyyy) %>%
   group_by(route_category, service_dt) %>%
   summarise(across(c(num_trips, total_runtime_minutes, total_runtime_km), sum), .groups='drop') %>%
-  ggplot(aes(fill=route_category, y=total_runtime_minutes, x=service_dt)) + 
+  ggplot(aes(fill=route_category, y=total_runtime_minutes, x=as.character(service_dt))) + 
     geom_bar(position="stack", stat="identity") + 
-    ggtitle("Total Scheduled MBTA Runtime by Route Category (Tuesdays, 2019-present)")
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    ggtitle(paste0("Total Scheduled MBTA Runtime by Route Category (Tuesdays, ", as.character(yyyy), "-present)"))
 ```
 
 Identify service days with suspiciously low total runtimes
@@ -676,9 +636,74 @@ test_query <- paste0("
 t <- run_duckdb(test_query)
 ```
 
-This is useful for ascertaining the service dates contained within the GTFS calendar. Take note of the calendar range, as you will have to specify a date and time that falls within this interval when running the origin-destination matrix calculation below.
+## Pull MBTA GTFS full feeds / Create Feed Lookups
 
-# Accessibility Calculations
+```{r mbta gtfs}
+mbta_feed_index <- read.csv('https://cdn.mbta.com/archive/archived_feeds.txt')
+
+# only downloads the feed for a given date if that feed is not already present in data_path
+lookup_mbta_feed_from_date <- function(yyyymmdd) {
+  feed_url <- mbta_feed_index[mbta_feed_index$feed_start_date <= yyyymmdd 
+                         & mbta_feed_index$feed_end_date >= yyyymmdd,'archive_url']
+  fname <- sub(".*/", "", feed_url)
+  
+  if (!file.exists(file.path(data_path, fname))) {
+    download.file(url = feed_url,
+              destfile = file.path(data_path, fname), mode = "wb")
+  }
+  lookup <- list()
+  lookup[[as.character(yyyymmdd)]] <- fname
+  return(lookup)
+}
+
+feed_list <- function(dates) {
+  feed_lookup <- list()
+  
+  for (dt in dates) {
+    feed_lookup <- c(feed_lookup, lookup_mbta_feed_from_date(dt))
+  }
+  
+  return(feed_lookup)
+}
+
+
+```
+
+Option 1: get all dates for specific days of the week within a range
+
+```{r}
+date_start <- "2024-10-29"
+date_end <- "2025-02-01"
+
+# get list of dates for selected days of week before and after 12/15/2025
+dtrange <- seq(as.Date(date_start), as.Date(date_end), by="days")
+
+tuesdays <- dtrange[weekdays(dtrange) == 'Tuesday'] %>% format('%Y%m%d') %>% as.integer()
+saturdays <- dtrange[weekdays(dtrange) == 'Saturday'] %>% format('%Y%m%d') %>% as.integer()
+
+mbta_tues_lookup <- feed_list(tuesdays)
+mbta_sat_lookup <- feed_list(saturdays)
+```
+
+Option 2: define list of specific dates to analyze
+
+```{r}
+mbta_analysis_dates <- c(
+  20221206, 20221213, 20230103, # glx medford -> winter 2023
+  20230228, 20230321, # spring 2023
+  20230627, 20230711, # summer 2023
+  20230822, 20230829, # fall 2023
+  20240402, 20240409, # spring 2024
+  20240611, 20240618, # summer 2024
+  20240813, 20240827, # fall 2024
+  20241203, 20250107 # winter 2025 (including BNR phase 1)
+)
+
+mbta_analysis_lookup <- feed_list(mbta_analysis_dates)
+```
+
+
+# R5R Calculations
 
 ## Define Parameters and Prepare Data
 
@@ -730,10 +755,10 @@ mode <- c("WALK", "TRANSIT")
 #max_lts = 2 # The maximum level of traffic stress that cyclists will tolerate. A value of 1 means cyclists will only travel through the quietest streets, while a value of 4 indicates cyclists can travel through any road; defaults to 2
 
 # max trip duration (minutes)
-max_trip_duration = 45
+max_trip_duration = 60
 
 # set the time of day for the departure (date will be set later)
-departure_time_hms <- "08:00:00"
+departure_time_hms <- "07:30:00"
 
 # # of minutes starting from departure_time_hms within which to consider trip starts
 time_window_minutes <- 30 
@@ -780,11 +805,12 @@ opportunities_j <- destinations_j %>%
 Third, an origin-destination matrix is calculated for each service date in accordance with the travel and batching parameters set earlier. In this case, I have set the ODCM to save to disk as a parquet dataset, which is a great format for compressed storage and for larger-than-memory calculations. This process took about 35 minutes per date for MBTA blocks (n=~80k).
 
 ```{r}
+lookup <- mbta_analysis_lookup
 # loop through lookup and get feed_day (name) and feed_curr (value)
 # name the ttm after the feed day, since different days on the same feed could (?) be different
-for (i in 1:length(mbta_tues_lookup)) {
-  feed_day <- names(mbta_tues_lookup)[[i]]
-  feed_curr <- mbta_tues_lookup[[i]]
+for (i in 1:length(lookup)) {
+  feed_day <- names(lookup)[[i]]
+  feed_curr <- lookup[[i]]
   
   # move the current feed into the r5 path from the data path
   file_move(path(data_path, feed_curr), path(r5_path, feed_curr))
@@ -963,7 +989,6 @@ axs_dfs %>%
   )
   
 ```
-
 
 # FINDINGS
 
