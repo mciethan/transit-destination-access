@@ -638,6 +638,8 @@ t <- run_duckdb(test_query)
 
 ## Pull MBTA GTFS full feeds / Create Feed Lookups
 
+First, get the MBTA GTFS feed index and create data pulling functions based on it
+
 ```{r mbta gtfs}
 mbta_feed_index <- read.csv('https://cdn.mbta.com/archive/archived_feeds.txt')
 
@@ -700,6 +702,59 @@ mbta_analysis_dates <- c(
 )
 
 mbta_analysis_lookup <- feed_list(mbta_analysis_dates)
+```
+
+```{r}
+gtfs_metrics %>%
+  filter(service_day %in% c(b4_day, aft_day), route_id %in% c('86', '104', '109'))
+```
+
+
+# Quantity-of-service calculations (before/after)
+
+```{r}
+# functions based on a before date and an after date, referencing gtfs_metrics?
+# several aggregation levels: start with route, but keep the route category info as well
+b4_day <- 20241203
+aft_day <- 20250107
+
+gtfs_metrics %>% 
+  filter(service_day %in% c(b4_day, aft_day)) %>%
+  group_by(service_day, route_desc) %>%
+  summarise(
+    across(c(num_trips, total_runtime_minutes, total_runtime_km), sum), 
+    .groups='drop'
+    ) %>%
+  pivot_wider(
+    id_cols= route_desc, # TODO: figure out how to handle changes in route_desc
+    values_from=c(num_trips, total_runtime_minutes, total_runtime_km),
+    names_from=service_day
+    ) %>%
+  mutate(
+    num_trips_b4 = get(paste0('num_trips_', as.character(b4_day))),
+    runtime_min_b4 = get(paste0('total_runtime_minutes_', as.character(b4_day))),
+    runtime_km_b4 = get(paste0('total_runtime_km_', as.character(b4_day))),
+    chg_trips = get(paste0('num_trips_', as.character(aft_day))) - num_trips_b4,
+    chg_min = get(paste0('total_runtime_minutes_', as.character(aft_day))) - runtime_min_b4,
+    chg_km = round(
+      get(paste0('total_runtime_km_', as.character(aft_day))) - runtime_km_b4, 0),
+    pct_chg_trips = chg_trips / num_trips_b4,
+    pct_chg_min = chg_min / runtime_min_b4,
+    pct_chg_km = chg_km / runtime_km_b4
+  ) %>%
+  filter(chg_trips != 0 | chg_min != 0 | chg_km != 0) %>%
+  select(-c(num_trips_b4, runtime_min_b4, runtime_km_b4))
+```
+analysis of winter 2023 changes
+
+More runtime minutes and km at a high level suggests longer trips for CR. Newburyport is just one additional trip but a bunch of additional minutes and km, which could indicate replacing short-branch trips with long-branch trips, but Franklin has more km without additional trips or minutes, which is more of a mystery. 
+
+For Ferry, somehow we're covering less distance in the same number of trips and same runtime on both F1 and F4?
+
+maybe there is a typology of changes we can identify at the route level and include a rollup of that in the high level report. For key bus, there are more trips routes, fewer trips routes, and then routes with either adjusted runtimes or adjusted run distances but the same number of trips.  Any classification system I do is a simplification because more or fewer trips may mask simultaneously changing runtimes or run distances, but we have those three totals to still work with. 
+
+```{r}
+chg_detail %>% filter(route_desc == 'Key Bus')
 ```
 
 
@@ -873,7 +928,7 @@ for (i in 1:length(lookup)) {
 
 ## Calculate and Summarize Accessibility
 
-Finally, accessibilities are calculated using the selected impedance function(s) by iterating over all the batches of the origin-destination matrix. There's a few ways of doing this.
+Finally, accessibilities are calculated using the selected impedance function(s) by iterating over all the batches of the origin-destination matrix per service date. There's a few ways of doing this.
 
 TODO: try generating some of the accessibility outputs shown here: https://cran.r-project.org/web/packages/r5r/vignettes/accessibility.html
 
