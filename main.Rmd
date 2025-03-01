@@ -636,7 +636,7 @@ test_query <- paste0("
 t <- run_duckdb(test_query)
 ```
 
-## Pull MBTA GTFS full feeds / Create Feed Lookups
+## Create Feed Lookups & Pull MBTA GTFS full feeds
 
 First, get the MBTA GTFS feed index and create data pulling functions based on it
 
@@ -667,8 +667,6 @@ feed_list <- function(dates) {
   
   return(feed_lookup)
 }
-
-
 ```
 
 Option 1: get all dates for specific days of the week within a range
@@ -690,73 +688,93 @@ mbta_sat_lookup <- feed_list(saturdays)
 Option 2: define list of specific dates to analyze
 
 ```{r}
-mbta_analysis_dates <- c(
-  20221206, 20221213, 20230103, # glx medford -> winter 2023
-  20230228, 20230321, # spring 2023
-  20230627, 20230711, # summer 2023
-  20230822, 20230829, # fall 2023
-  20240402, 20240409, # spring 2024
-  20240611, 20240618, # summer 2024
-  20240813, 20240827, # fall 2024
-  20241203, 20250107 # winter 2025 (including BNR phase 1)
+mbta_changes <- list(
+  'GLX Medford Opening' = c(20221206, 20221213), # 20221212
+  'Winter 2023' = c(20221213, 20230103), # 20221218
+  'Spring 2023' = c(20230228, 20230321), # 20230312
+  'Summer 2023' = c(20230627, 20230711), # 20230702
+  'Fall 2023' = c(20230822, 20230829), # 20230827
+  'Spring 2024' = c(20240402, 20240409), # 20240407
+  'Summer 2024' = c(20240611, 20240618), # 20240616
+  'Fall 2024' = c(20240813, 20240827), # 20240825
+  'Winter 2025 (BNR Phase 1)' = c(20241203, 20250107) # 20241215
 )
 
+mbta_analysis_dates <- unique(unlist(mbta_changes))
 mbta_analysis_lookup <- feed_list(mbta_analysis_dates)
 ```
 
 ```{r}
-gtfs_metrics %>%
-  filter(service_day %in% c(b4_day, aft_day), route_id %in% c('86', '104', '109'))
+# mbta_analysis_lookup <- mbta_analysis_lookup[-c(1,2)][-2]
 ```
 
 
 # Quantity-of-service calculations (before/after)
 
 ```{r}
-# functions based on a before date and an after date, referencing gtfs_metrics?
-# several aggregation levels: start with route, but keep the route category info as well
-b4_day <- 20241203
-aft_day <- 20250107
-
-gtfs_metrics %>% 
-  filter(service_day %in% c(b4_day, aft_day)) %>%
-  group_by(service_day, route_desc) %>%
-  summarise(
-    across(c(num_trips, total_runtime_minutes, total_runtime_km), sum), 
-    .groups='drop'
+# this function summarizes gtfs_metrics changes for a given element of the mbta_changes list
+mbta_change_summary <- function(change_name, by_route=FALSE) {
+  agg_cols <- 'route_category'
+  if (by_route) agg_cols <- c('route_id', agg_cols)
+  
+  b4_day <- mbta_changes[[change_name]][1]
+  aft_day <- mbta_changes[[change_name]][2]
+  
+  gtfs_metrics %>% 
+    filter(service_day %in% c(b4_day, aft_day)) %>%
+    mutate(
+      route_category = case_when(
+        route_desc %in% c('Community Bus', 'Commuter Bus', 'Coverage Bus', 
+                          'Supplemental Bus', 'Local Bus') ~ 'Other Bus',
+        route_desc %in% c('Frequent Bus', 'Key Bus') ~ 'Frequent Bus',
+        route_desc %in% c('Commuter Rail', 'Regional Rail') ~ 'Regional Rail',
+        .default = route_desc
+        )
+      ) %>%
+    group_by(across(all_of(c('service_day', agg_cols)))) %>%
+    summarise(
+      across(c(num_trips, total_runtime_minutes, total_runtime_km), sum), 
+      .groups='drop'
+      ) %>%
+    pivot_wider(
+      id_cols= all_of(agg_cols),
+      values_from=c(num_trips, total_runtime_minutes, total_runtime_km),
+      names_from=service_day,
+      values_fill = 0
+      ) %>%
+    mutate(
+      num_trips_b4 = get(paste0('num_trips_', as.character(b4_day))),
+      runtime_min_b4 = get(paste0('total_runtime_minutes_', as.character(b4_day))),
+      runtime_km_b4 = get(paste0('total_runtime_km_', as.character(b4_day))),
+      chg_trips = get(paste0('num_trips_', as.character(aft_day))) - num_trips_b4,
+      chg_min = get(paste0('total_runtime_minutes_', as.character(aft_day))) - runtime_min_b4,
+      chg_km = round(
+        get(paste0('total_runtime_km_', as.character(aft_day))) - runtime_km_b4, 0),
+      pct_chg_trips = round(100*chg_trips / num_trips_b4, 2),
+      pct_chg_min = round(100*chg_min / runtime_min_b4, 2),
+      pct_chg_km = round(100*chg_km / runtime_km_b4, 2)
     ) %>%
-  pivot_wider(
-    id_cols= route_desc, # TODO: figure out how to handle changes in route_desc
-    values_from=c(num_trips, total_runtime_minutes, total_runtime_km),
-    names_from=service_day
-    ) %>%
-  mutate(
-    num_trips_b4 = get(paste0('num_trips_', as.character(b4_day))),
-    runtime_min_b4 = get(paste0('total_runtime_minutes_', as.character(b4_day))),
-    runtime_km_b4 = get(paste0('total_runtime_km_', as.character(b4_day))),
-    chg_trips = get(paste0('num_trips_', as.character(aft_day))) - num_trips_b4,
-    chg_min = get(paste0('total_runtime_minutes_', as.character(aft_day))) - runtime_min_b4,
-    chg_km = round(
-      get(paste0('total_runtime_km_', as.character(aft_day))) - runtime_km_b4, 0),
-    pct_chg_trips = chg_trips / num_trips_b4,
-    pct_chg_min = chg_min / runtime_min_b4,
-    pct_chg_km = chg_km / runtime_km_b4
-  ) %>%
-  filter(chg_trips != 0 | chg_min != 0 | chg_km != 0) %>%
-  select(-c(num_trips_b4, runtime_min_b4, runtime_km_b4))
+    filter(chg_trips != 0 | chg_min != 0 | chg_km != 0) %>%
+    select(
+      all_of(c(agg_cols, 'chg_trips', 'chg_min', 'chg_km', 
+               'pct_chg_trips', 'pct_chg_min', 'pct_chg_km'))
+    )
+}
 ```
-analysis of winter 2023 changes
-
-More runtime minutes and km at a high level suggests longer trips for CR. Newburyport is just one additional trip but a bunch of additional minutes and km, which could indicate replacing short-branch trips with long-branch trips, but Franklin has more km without additional trips or minutes, which is more of a mystery. 
-
-For Ferry, somehow we're covering less distance in the same number of trips and same runtime on both F1 and F4?
-
-maybe there is a typology of changes we can identify at the route level and include a rollup of that in the high level report. For key bus, there are more trips routes, fewer trips routes, and then routes with either adjusted runtimes or adjusted run distances but the same number of trips.  Any classification system I do is a simplification because more or fewer trips may mask simultaneously changing runtimes or run distances, but we have those three totals to still work with. 
 
 ```{r}
-chg_detail %>% filter(route_desc == 'Key Bus')
+mbta_change_summaries_highlevel <- names(mbta_changes) %>%
+  lapply(mbta_change_summary) %>%
+  `names<-`(names(mbta_changes))
+
+mbta_change_summaries_routelevel <- names(mbta_changes) %>%
+  lapply(function(n) mbta_change_summary(n, by_route=T)) %>%
+  `names<-`(names(mbta_changes))
 ```
 
+I should have enough now to give color / interpretation of the quantity-of-service changes at least for full days. This will be a bit different from the morning peak hour changes. The only way to really filter out any "noise" would be to rerun gtfs_metrics to only pull statistics for the morning hours, but maybe the full-day statistics will be OK. 
+
+The other piece is to identify which pieces of these summaries I will actually publish. I imagine a table with each row as a change and a selection of columns for both the service changes and the access changes, and then additional color / detail in the text. 
 
 # R5R Calculations
 
@@ -946,68 +964,67 @@ I'm realizing that there is a large rabbit hole of possible metrics here, even i
 lud <- mbta_cb_poly %>%
   rename(id = all_of(origins_id_field))
 
-time_window_pctile_cols <- time_window_percentiles %>% 
-  as.character() %>% 
-  lapply(function(n) paste0('travel_time_p', n)) %>% 
-  unlist()
+time_window_pctile_suffixes <- '_p' %>%
+  paste0(time_window_percentiles %>% as.character())
 ```
 
-```{r calculate accessibility using arrow, echo = FALSE}
-read_ttm_from_day <- function(feed_day) {
+```{r}
+read_ttm_for_day <- function(feed_day) {
   open_dataset(path(paste0(ttm_path, '/', as.character(feed_day)))) %>%
     collect()
 }
 
-axs_at_pctile <- function(pctile_suffix, tt_matrix) {
-  tt_matrix %>%
+axs_at_pctile <- function(ttm, feed_day, pctile_suffix) {
+  ttm_pctile <- ttm %>%
+    select(all_of(
+      c('from_id', 'to_id', paste0('travel_time', pctile_suffix))
+      )) 
+  
+  print(paste("Calculating destination access for", pctile_suffix))
+  axs_pctile <- ttm_pctile %>%
     cumulative_cutoff(
-      land_use_data = lud, opportunity = 'total_emp',
-      travel_cost = paste0('travel_time', pctile_suffix), 
-      cutoff=max_trip_duration
-    ) %>%
-    rename_with(~paste0('total_emp', pctile_suffix), total_emp)
+        land_use_data = lud, opportunity = 'total_emp',
+        travel_cost = paste0('travel_time', pctile_suffix), 
+        cutoff=max_trip_duration
+      ) 
+  
+  axs_pctile %>%
+    rename_with(~paste0('total_emp', pctile_suffix), total_emp) %>%
+    mutate(service_day = feed_day)
 }
 
-axs_window_percentiles <- function(tt_matrix) {
-  '_p' %>% # create suffixes from global variable time_window_percentiles
-    paste0(time_window_percentiles %>% as.character()) %>%
+axs_window_percentiles <- function(ttm, feed_day) {
+   time_window_pctile_suffixes %>%
     # then calculate the access at each time window percentile for the given ttm
-    lapply(function(p) axs_at_pctile(p, tt_matrix)) %>%
+    lapply(function(p) axs_at_pctile(ttm, feed_day, p)) %>%
     reduce(inner_join, by='id') # and join the results
 }
 ```
 
-Read the travel time matrices for a set of dates and calculate accessibility per percentile. This cell took ~90s per date for MBTA blocks (n=~80k).  
+Read the travel time matrices for a set of dates and calculate accessibility per percentile. This cell took ~2min per date for MBTA blocks (n=~80k).  
 
 ```{r}
-for (feed_day in names(mbta_tues_lookup)) {
-  feed_day_str <- as.character(feed_day)
+for (feed_day in names(mbta_analysis_lookup)) {
+  print(paste("Reading travel time matrix for", as.character(feed_day)))
+  ttm <- read_ttm_for_day(feed_day)
   
-  open_dataset(path(paste0(ttm_path, '/', feed_day_str))) %>%
-    collect() %>%
-    axs_window_percentiles() %>%
-    mutate(service_day = feed_day) %>%
+  print(paste("Calculating destination access for", as.character(feed_day)))
+  axs_window_percentiles(ttm, feed_day) %>%
     write.csv(
-      path(outputs_path, paste0(feed_day_str, ".csv")), 
+      path(outputs_path, paste0(as.character(feed_day), ".csv")), 
       row.names=F
     )
 }
+```
 
-# for (feed_day in names(mbta_tues_lookup)) {
-#   feed_day_str <- as.character(feed_day)
-#   
-#   df <- read.csv(path(outputs_path, paste0(feed_day_str, ".csv")))
-#   df %>%
-#     mutate(service_day = feed_day) %>%
-#     write.csv(
-#       path(outputs_path, paste0(feed_day_str, ".csv")), 
-#       row.names=F
-#     )
-# }
+Read in previously calculated accessibility dataframes
 
-axs_dfs <- names(mbta_tues_lookup) %>%
+```{r}
+axs_dfs <- names(mbta_analysis_lookup) %>%
   lapply(function(fd) read.csv(path(outputs_path, paste0(as.character(fd), ".csv"))))
 ```
+
+TODO: get race/ethn data and join that in too
 
 ```{r}
 block_pops <- mbta_cb_poly %>%
