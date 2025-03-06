@@ -23,23 +23,25 @@ options(java.parameters = "-Xmx6G")
 
 # load packages
 library(corrplot)
-library(httr)
+library(httr) # to pull Transitland API data with GET requests
 library(jsonlite)
 library(knitr)
-library(lehdr)
-library(tigris)
-library(tidyverse)
-library(fs)
-library(r5r)
+library(lehdr) # for pulling US Census LODES data
+library(tigris) # for pulling US Census shapefiles
+library(tidyverse) # for tidy functions and syntax
+library(fs) # for file path operations
+library(r5r) # for calculating travel time matrices over transportation networks
 library(sf)
 library(tmap)
 library(tidycensus)
 library(tidytransit)
 library(viridis)
 library(progress)
-library(arrow)
-library(duckdb)
-library(accessibility)
+library(arrow) # for batched read + write + transform of parquet files on disk
+library(duckdb) # for querying MBTA LAMP
+library(accessibility) # for calculating destination access measures
+library(scales) # for chart axis formatting
+library(Hmisc) # for wtd.quantile function
 
 # setup options
 tmap_mode("plot")
@@ -688,7 +690,7 @@ mbta_sat_lookup <- feed_list(saturdays)
 Option 2: define list of specific dates to analyze
 
 ```{r}
-mbta_changes <- list(
+mbta_changes <- list( # the comments define the effective date for each change
   'GLX Medford Opening' = c(20221206, 20221213), # 20221212
   'Winter 2023' = c(20221213, 20230103), # 20221218
   'Spring 2023' = c(20230228, 20230321), # 20230312
@@ -703,11 +705,6 @@ mbta_changes <- list(
 mbta_analysis_dates <- unique(unlist(mbta_changes))
 mbta_analysis_lookup <- feed_list(mbta_analysis_dates)
 ```
-
-```{r}
-# mbta_analysis_lookup <- mbta_analysis_lookup[-c(1,2)][-2]
-```
-
 
 # Quantity-of-service calculations (before/after)
 
@@ -944,7 +941,7 @@ for (i in 1:length(lookup)) {
 }
 ```
 
-## Calculate and Summarize Accessibility
+## Calculate Accessibility
 
 Finally, accessibilities are calculated using the selected impedance function(s) by iterating over all the batches of the origin-destination matrix per service date. There's a few ways of doing this.
 
@@ -997,7 +994,7 @@ axs_window_percentiles <- function(ttm, feed_day) {
    time_window_pctile_suffixes %>%
     # then calculate the access at each time window percentile for the given ttm
     lapply(function(p) axs_at_pctile(ttm, feed_day, p)) %>%
-    reduce(inner_join, by='id') # and join the results
+    reduce(inner_join, by=c('service_day', 'id')) # and join the results
 }
 ```
 
@@ -1017,11 +1014,14 @@ for (feed_day in names(mbta_analysis_lookup)) {
 }
 ```
 
+## Summarize Accessibility
+
 Read in previously calculated accessibility dataframes
 
 ```{r}
 axs_dfs <- names(mbta_analysis_lookup) %>%
-  lapply(function(fd) read.csv(path(outputs_path, paste0(as.character(fd), ".csv"))))
+  lapply(function(fd) read.csv(path(outputs_path, paste0(as.character(fd), ".csv")))) %>%
+  `names<-`(names(mbta_analysis_lookup))
 ```
 
 TODO: get race/ethn data and join that in too
@@ -1032,39 +1032,215 @@ block_pops <- mbta_cb_poly %>%
   rename(id = all_of(origins_id_field)) %>%
   mutate(id = as.numeric(id)) %>%
   select(id, total_pop)
+```
 
+```{r}
+axs_all <- axs_dfs %>%
+  bind_rows() %>%
+  inner_join(block_pops, by='id')
+```
+
+### Compare distributions of access changes
+
+As a prerequisite, we create dataframes of the before-and-after for each change
+
+```{r}
+# for each mbta_change to consider, create a before and after and then stack?
+# given that a single service date can be part of multiple calcs, that be the best way
+chg_axs <- function(chg_name) {
+  axs_all %>%
+    filter(service_day %in% mbta_changes[[chg_name]]) %>%
+    mutate(period = case_when(
+      service_day == mbta_changes[[chg_name]][2] ~ 'after',
+      .default='before')) %>%
+    pivot_wider(
+      id_cols=c('id', 'total_pop'), 
+      names_from='period', 
+      values_from='total_emp_p50') %>%
+    mutate(change_name = chg_name, delta_p50 = after - before,
+           access_bin_before = before - (before %% 10000),
+          access_bin_after = after - (after %% 10000)) %>%
+    arrange(before) %>%
+    mutate(pop_pctile_before = lag(cumsum(total_pop), default = 0)/(sum(total_pop) - 1)) %>%
+    arrange(after) %>%
+    mutate(pop_pctile_after = lag(cumsum(total_pop), default = 0)/(sum(total_pop) - 1)) %>%
+    mutate(delta_pop_pctile = pop_pctile_after - pop_pctile_before)
+}
+
+mbta_axs_changes <- names(mbta_changes) %>%
+  lapply(chg_axs) %>%
+  bind_rows()
+```
+
+TODO: create separate chart or option for comparing change distributions by TOD ptile
+TODO: look into statistics that would capture different kinds of distributions, which I could report alongside the total number of affected population
+
+The viz below compares the distributions of changes across scenarios. It shows that most of the distributions are quite similar, with all but GLX Medford Opening having a mix of winners and losers with tails leaning in the direction of the service changes.  I'm not sure if any of these will make it into the final paper, given that the untransformed-axis charts make it hard to compare across adjustments, while the transformed-axis charts imply a bimodal distribution that isn't really there. 
+
+```{r}
+# the first element of this will be plotted first (back), then the next overlaid in front of it, etc 
+adjustments_to_plot <- c('Winter 2025 (BNR Phase 1)', 'Summer 2023', 'GLX Medford Opening')
+#pseudolog10_breaks <- c(-1*(10^seq(1,5, by=1)), 10^seq(1,5, by=1))
+
+mbta_axs_changes %>%
+  filter(
+    delta_p50 != 0, # only consider the affected population for each adjustment
+    change_name %in% adjustments_to_plot) %>%
+  mutate(change_name = factor(change_name, levels=adjustments_to_plot)) %>%
+  ggplot(aes(x=delta_p50)) +
+  geom_vline(xintercept = 0, linetype='longdash') +
+  scale_x_continuous(label=comma, limits=c(-50000,50000)
+                     #, transform=pseudolog10_trans, breaks=pseudolog10_breaks
+                     ) +
+  
+  # OPTION 1: access changes per population (non-normalized - compare overall sizes)
+  geom_area(
+    aes(weight=total_pop, fill=change_name),
+    position='identity', alpha=0.5,
+    stat = "bin", binwidth=1000) +
+  geom_freqpoly(
+    aes(weight=total_pop, group=change_name),
+    alpha=0.5, stat = "bin", binwidth=1000) +
+  labs(x='Change in Jobs Accessible', y='Affected Population', fill='Adjustment Name',
+       title='Job Access Change Distributions (Absolute) per Service Change') +
+  scale_y_continuous(label=comma)
+
+  # # OPTION 2: access changes per population portion (normalized, compare concentrations)
+  # geom_density(aes(weight=total_pop, fill=change_name, alpha=0.5)) +
+  # labs(x='Change in Jobs Accessible', y='Portion of Affected Population per Adjustment', fill='Adjustment Name',
+  #      title='Job Access Change Distributions (Proportional) per Service Change')
+```
+
+The viz below shows how much a given adjustment adds or subtracts access (on net) from communities with lower or higher pre-existing access levels. The Summer 2023 schedule decreased access on net for medium- and high-access communities while adding access for some previously low-access communities. Meanwhile, the GLX Medford opening added access in mostly medium-to-high access communities, while BNR Phase 1 netted large access gains across the board, but especially in previously low-access communities. This viz masks the variation within before-access bins, since we know from the previous chart that Winter 2025 changes had some losers, it's just that everyone's losses are netted out by the gains of other communities with similar pre-existing access levels.
+
+```{r}
+mbta_axs_changes %>%
+  filter(change_name %in% adjustments_to_plot) %>%
+  mutate(#pop_ptile_b4_bin = round(pop_pctile_before*100),
+         change_name = factor(change_name, levels=adjustments_to_plot)) %>%
+  group_by(change_name, access_bin_before) %>%
+  summarise(chg_personjob_access = sum(total_pop * delta_p50), .groups='drop') %>%
+  ggplot() + 
+  geom_col(aes(x=access_bin_before, y=chg_personjob_access, fill=as.factor(change_name)),
+           alpha=.5, position='identity') +
+  scale_x_continuous(label=comma) + 
+  scale_y_continuous(label=comma) +
+  labs(x='Pre-Adjustment Jobs Accessible', 
+       y='Aggregate Population-Weighted Change in Jobs Accessible', 
+       fill='Adjustment Name',
+       title='Changes in Population-Weighted Jobs Accessible by Pre-Adjustment Access Level')
+```
+
+Substituting pop_ptile_b4_bin for access_bin shows that >50% of the population of the 7 MA counties in my analysis have access to <10k jobs via MBTA+walk, and see barely any changes because those jobs are probably all walk and they're far away from MBTA service. I could conceivably do a post-hoc filter for blocks within a mile or two of MBTA stops, and that would be a better method for comparability across metros, but whatever filter I apply would both not fully solve that chart problem and be somewhat arbitrary.
+
+I also tried graphing the changes in population per access bin for a given change ("an additional x people joined the cohort of people with access to y jobs or more") but it ends up looking like radio spaghetti due to populations moving from one group to another showing up as losses / gains in adjacent bins. I'm saving it as optional code in case some derivative of this becomes interesting, but I doubt it.
+
+```{r}
+# pop_per_bin_b4 <- mbta_axs_changes %>%
+#   filter(change_name %in% adjustments_to_plot) %>%
+#   group_by(change_name, access_bin_before) %>%
+#   summarise(total_pop = sum(total_pop), .groups='drop')
+# 
+# pop_per_bin_aft <- mbta_axs_changes %>%
+#   filter(change_name %in% adjustments_to_plot) %>%
+#   group_by(change_name, access_bin_after) %>%
+#   summarise(total_pop = sum(total_pop), .groups='drop')
+# 
+# pop_per_bin_b4 %>%
+#   full_join(pop_per_bin_aft, by=join_by(
+#     change_name == change_name, access_bin_before == access_bin_after
+#     ), suffix=c('_b4', '_aft')) %>%
+#   mutate(delta_pop = total_pop_aft - total_pop_b4) %>%
+#   ggplot() + 
+#   geom_col(aes(x=access_bin_before, y=delta_pop, fill=as.factor(change_name)),
+#            alpha=.5, position='identity') +
+#   scale_x_continuous(label=comma) + 
+#   scale_y_continuous(label=comma) +
+#   labs(x='Jobs Accessible', 
+#        y='Change in Population', 
+#        fill='Adjustment Name',
+#        title='Changes in Population by Access Level')
+```
+
+### Maps & Spatial Analysis
+
+TODO: map of snapshot access
+TODO: map of change in access for an adjustment
+TODO: decide on adding spatial autocorrelation or other statistics to aggregate_axs()
+
+### Summary statistics across adjustments
+
+TODO: add summary statistics of social and geographic equity
+- first, get the race/ethn data joined into block_pops
+- then, group befores, afters, and changes by race/ethn and do stderr / anova / tukey & charts
+- then add gini & palma to aggregate_axs()
+
+
+```{r}
 aggregate_axs <- function(df) {
   df %>% 
     inner_join(block_pops, by='id') %>%
     group_by(service_day) %>%
     summarise(
-      across(total_emp_p15:total_emp_p85, ~ weighted.mean(.x, total_pop)),
+      across(total_emp_p15:total_emp_p85, ~ weighted.mean(.x, total_pop),
+             .names='{.col}_popmean'),
+      across(total_emp_p15:total_emp_p85, ~ quantile(.x, probs=0.8), 
+             .names='{.col}_blockp80'),
+      across(total_emp_p15:total_emp_p85, ~ wtd.quantile(.x, weights=total_pop, probs=0.8), 
+           .names='{.col}_popp80'),
       .groups='drop'
       )
 }
 ```
 
+```{r testing}
+axs_all %>%
+  group_by(service_day) %>%
+  summarise(
+    across(total_emp_p15:total_emp_p85, ~ weighted.mean(.x, total_pop), 
+           .names='{.col}_popmean'),
+    across(total_emp_p15:total_emp_p85, ~ quantile(.x, probs=0.8), 
+           .names='{.col}_blockp80'),
+    across(total_emp_p15:total_emp_p85, ~ wtd.quantile(.x, weights=total_pop, probs=0.8), 
+           .names='{.col}_popp80'),
+    .groups='drop'
+    )
+  # arrange(total_emp_p50) %>% 
+  # mutate(wtd_ptile = lag(cumsum(total_pop), default = 0)/(sum(total_pop) - 1))
+```
+
 ```{r}
-axs_dfs %>%
+axs_agg <- axs_dfs %>%
   lapply(aggregate_axs) %>%
-  bind_rows() %>%
+  bind_rows()
+```
+
+TODO: add additional lines and ribbons for high, medium, and low-access population percentiles (or whatever categories make sense)
+TODO: figure out and toggle between central-tendency lines and actual-observation lines for particular percentiles / statistics
+
+```{r}
+metric <- 'popp80'
+
+axs_agg %>%
   mutate(service_date = as.POSIXct(strptime(as.character(service_day), '%Y%m%d'))) %>%
-  ggplot(aes(x=service_date, y=total_emp_p50)) +
-  geom_line(aes(x=service_date, y=total_emp_p50)) +
+  ggplot(aes(x=service_date, y=get(paste0('total_emp_p50_', metric)))) +
+  geom_line(aes(x=service_date, y=get(paste0('total_emp_p50_', metric)))) +
+  geom_point(aes(x=service_date, y=get(paste0('total_emp_p50_', metric)))) +
   geom_ribbon(
-    aes(x=service_date, y=total_emp_p50, ymax=total_emp_p15, ymin=total_emp_p85), 
-    alpha=0.2) +
-  lims(y=c(0,100000)) +
+    aes(x=service_date, y=get(paste0('total_emp_p50_', metric)), 
+        ymax=get(paste0('total_emp_p30_', metric)), 
+        ymin=get(paste0('total_emp_p70_', metric))
+        ), alpha=0.2) +
+  scale_y_continuous(labels=comma) +
   labs(
-    title="Job Accessibility via Transit for Average MBTA-Area Resident, 11/2024 to 02/2025",
-    y = "Jobs Accessible via Transit & Walking within 45 Minutes", x="Tuesdays"
+    title="Job Accessibility via Transit for Average MBTA-Area Resident",
+    y = "Jobs Accessible via Transit & Walking within 60 Minutes", x="Tuesdays"
   )
   
 ```
 
-# FINDINGS
-
-In the sample analysis, the `travel_time_matrix()` function from the `r5r` package to calculate accessibility to employment reachable within 45 minutes from each of New York City’s 38,800 census blocks using walking and transit and a selection of 5 impedance measures from Kwan (1998). Mapped results are shown in Figure 2. The use of multiprocessing by R5 offers fast calculation of the OD matrix while the implementation of a batching workflow using `arrow` limits memory use for very large analyses and stores results on disk. 
+TODO (maybe): erase block polygons with water
+TODO: create block maps of # & % changes in access for an individual adjustment
 
 ```{r figure2, fig.height=3.5, fig.width=12.5, fig.cap="\\label{fig:figure2}Figure 2. Transit Employment Accessibility Comparison", message=FALSE, warning=FALSE, echo=FALSE}
 # join results to input_sf object
