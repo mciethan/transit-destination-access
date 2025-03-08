@@ -282,7 +282,7 @@ Calculating place-based accessibility using the `R5R` package below requires the
 # DATA PROCESSING: MBTA
 ## Download and Prepare Census Data
 
-The first step is to download the census data that will be used as indicators of opportunities, including census population and employment data at the block level using the `tigris` and `lodes` packages respectively.
+The first step is to download the census data that will be used as indicators of opportunities, including census population and employment data at the block level using the `tigris` and `lodes` packages.
 
 ```{r download census employment data, include = FALSE, eval = FALSE}
 # include all MA counties with year-round MBTA service
@@ -301,7 +301,7 @@ ma_lodes <- grab_lodes(state = "ma",
   select(Block_GEOID, total_emp)
 ```
 
-Next, download census block geographic boundaries from New York City's Open Data catalogue, prepare standardized GEOIDs for joining, and join the population and employment data:
+Next, download census block geographic boundaries and population data from the US Census, prepare standardized GEOIDs for joining, and join the population and employment data:
 
 ```{r download and prepare census boundaries, include = FALSE, eval = FALSE}
 # download census block boundaries, including their populations
@@ -1024,15 +1024,28 @@ axs_dfs <- names(mbta_analysis_lookup) %>%
   `names<-`(names(mbta_analysis_lookup))
 ```
 
-TODO: get race/ethn data and join that in too
+Get race/ethn data and join that in too
+
+```{r}
+ma_blocks_raceethn <- read.csv(paste0(data_path, '/raceethn_2020_block_MA.csv'))
+```
+
+```{r}
+block_raceethn <- ma_blocks_raceethn %>%
+  mutate(block_id = as.numeric(substr(GEOID, 10, length(GEOID)))) %>%
+  select(block_id, nh_white, nh_black, nh_aapi, nh_others, hisp_all)
+```
 
 ```{r}
 block_pops <- mbta_cb_poly %>%
   st_drop_geometry() %>%
   rename(id = all_of(origins_id_field)) %>%
   mutate(id = as.numeric(id)) %>%
-  select(id, total_pop)
+  select(id, total_pop) %>%
+  inner_join(block_raceethn, by=join_by(id == block_id))
 ```
+
+Join access data to block populations
 
 ```{r}
 axs_all <- axs_dfs %>%
@@ -1054,7 +1067,7 @@ chg_axs <- function(chg_name) {
       service_day == mbta_changes[[chg_name]][2] ~ 'after',
       .default='before')) %>%
     pivot_wider(
-      id_cols=c('id', 'total_pop'), 
+      id_cols=c('id', 'total_pop', 'nh_white', 'nh_black', 'nh_aapi', 'nh_others', 'hisp_all'), 
       names_from='period', 
       values_from='total_emp_p50') %>%
     mutate(change_name = chg_name, delta_p50 = after - before,
@@ -1162,17 +1175,100 @@ I also tried graphing the changes in population per access bin for a given chang
 #        title='Changes in Population by Access Level')
 ```
 
+### Demographic breakdown visualizations
+
+average change in job access per demographic group by adjustment
+
+```{r}
+mbta_axs_changes %>%
+  mutate(change_name = factor(change_name, levels=names(mbta_changes))) %>%
+  pivot_longer(
+    cols=c(nh_white, nh_black, nh_aapi, nh_others, hisp_all),
+    names_to = 'race', values_to = 'pop'
+  ) %>% 
+  filter(pop != 0, delta_p50 != 0) %>%
+  # pivot_longer(
+  #   cols=c(before, after),
+  #   names_to = 'stage', values_to = 'access'
+  # ) %>% 
+  group_by(change_name, race) %>%
+  summarise(
+    mean_axs = wtd.mean(delta_p50, weights=pop),
+    stderr_axs = sqrt(wtd.var(delta_p50, weights=pop))/sqrt(sum(pop))
+    ) %>%
+  ggplot(aes(fill=race, x=race, y=mean_axs)) + 
+  geom_bar(position='dodge', stat='identity') +
+  #geom_bar(position=position_dodge(width=0.9)) +
+  geom_errorbar(aes(ymax=mean_axs + stderr_axs, ymin = mean_axs - stderr_axs), position=position_dodge(width=0.9), width=0.25) + 
+  facet_wrap(vars(change_name))
+```
+
+### Statistical tests for race & ethnicity
+
+```{r}
+named_group_split <- function(.tbl, ...) {
+  grouped <- group_by(.tbl, ...)
+  names <- rlang::inject(paste(!!!group_keys(grouped), sep = " / "))
+
+  grouped %>% 
+    group_split() %>% 
+    rlang::set_names(names)
+}
+
+axs_chgs_raceethn_aovs <- mbta_axs_changes %>%
+  pivot_longer(
+    cols=c(nh_white, nh_black, nh_aapi, nh_others, hisp_all),
+    names_to = 'race', values_to = 'pop'
+  ) %>% 
+  filter(pop != 0, delta_p50 != 0) %>%
+  named_group_split(change_name) %>%
+  map(function(df) {aov(delta_p50 ~ race, data=df, weights=df$pop)})
+```
+
+```{r}
+axs_chgs_raceethn_aovs %>%
+  map(summary)
+```
+
+Tukey post-hoc tests - many significant differences between groups in the mean deltas, but relatively small ones, at least at first glance, relative to the mean befores
+
+```{r}
+axs_chgs_raceethn_aovs %>%
+  map(TukeyHSD)
+```
+
 ### Maps & Spatial Analysis
 
 TODO: map of snapshot access
-TODO: map of change in access for an adjustment
+TODO: map of change in 15-to-85 range
+
+These tmap maps are useful for me as an exploration of various mappable metrics, but I'd rather just export to QGIS to make polished maps for publication rather than try to do it all here.
+
+```{r}
+sf_delta_axs <- origins_i_sf %>%
+  mutate(id = as.numeric(id)) %>%
+  inner_join(mbta_axs_changes %>% filter(change_name == 'Spring 2023'), by='id') %>%
+  filter(delta_p50 != 0)
+
+tm_shape(sf_delta_axs) +
+    tm_polygons(fill = 'delta_p50', 
+            fill.scale = tm_scale_continuous(values='brewer.rd_yl_gn'),
+            fill.legend = tm_legend("Change in Jobs Accessible"),
+            col_alpha = 0) #+
+    # tm_layout(frame = FALSE,
+    #           bg.color = "grey85",
+    #           legend.position = c("right", "bottom"),
+    #           legend.text.color = "white",
+    #           legend.title.color = "white")
+```
+
 TODO: decide on adding spatial autocorrelation or other statistics to aggregate_axs()
 
 ### Summary statistics across adjustments
 
 TODO: add summary statistics of social and geographic equity
-- first, get the race/ethn data joined into block_pops
-- then, group befores, afters, and changes by race/ethn and do stderr / anova / tukey & charts
+- then, group befores, afters, and changes by race/ethn and do stderr / anova / tukey
+- do mean & stderr charts by race/ethn
 - then add gini & palma to aggregate_axs()
 
 
