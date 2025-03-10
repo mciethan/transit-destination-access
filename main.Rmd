@@ -583,7 +583,7 @@ gtfs_metrics %>%
       levels=c('Rail Replacement Bus', 'Rapid Transit', 'Regional Rail', 'Ferry', 'Frequent Bus', 'Other Bus')
     )
     ) %>%
-  filter(weekdays(service_dt) == 'Tuesday', year(service_dt) >= yyyy) %>%
+  filter(weekdays(service_dt) == 'Tuesday', year(service_dt) == yyyy) %>%
   group_by(route_category, service_dt) %>%
   summarise(across(c(num_trips, total_runtime_minutes, total_runtime_km), sum), .groups='drop') %>%
   ggplot(aes(fill=route_category, y=total_runtime_minutes, x=as.character(service_dt))) + 
@@ -693,8 +693,9 @@ Option 2: define list of specific dates to analyze
 mbta_changes <- list( # the comments define the effective date for each change
   'GLX Medford Opening' = c(20221206, 20221213), # 20221212
   'Winter 2023' = c(20221213, 20230103), # 20221218
-  'Spring 2023' = c(20230228, 20230321), # 20230312
-  'Summer 2023' = c(20230627, 20230711), # 20230702
+  # 'Spring 2023' = c(20230228, 20230321), # 20230312
+  # 'Summer 2023' = c(20230627, 20230711), # 20230702
+  'Spring and Summer 2023' = c(20230228, 20230711),
   'Fall 2023' = c(20230822, 20230829), # 20230827
   'Spring 2024' = c(20240402, 20240409), # 20240407
   'Summer 2024' = c(20240611, 20240618), # 20240616
@@ -751,7 +752,7 @@ mbta_change_summary <- function(change_name, by_route=FALSE) {
       pct_chg_min = round(100*chg_min / runtime_min_b4, 2),
       pct_chg_km = round(100*chg_km / runtime_km_b4, 2)
     ) %>%
-    filter(chg_trips != 0 | chg_min != 0 | chg_km != 0) %>%
+    #filter(chg_trips != 0 | chg_min != 0 | chg_km != 0) %>%
     select(
       all_of(c(agg_cols, 'chg_trips', 'chg_min', 'chg_km', 
                'pct_chg_trips', 'pct_chg_min', 'pct_chg_km'))
@@ -769,9 +770,45 @@ mbta_change_summaries_routelevel <- names(mbta_changes) %>%
   `names<-`(names(mbta_changes))
 ```
 
+```{r}
+# # this confirms that the only non-temporary service change meeting the mode threshold was BNR Phase 1,
+# # and that's if you count Frequent Bus as a separate mode
+# mbta_change_summaries_highlevel %>%
+#   lapply(function(df) df %>% filter(abs(pct_chg_min) > 10))
+
+# this shows that both GLX medford and BNR Phase 1 met the route-level major change threshold, but so did:
+# - route 556 with no change in trips or distance in Winter 2025
+# - blue gaining min and orange losing min in winter 2023 beyond the threshold, seemingly unannounced
+# - though orange regained a similar amount of minutes in spring 2023
+# - 34 and 441/442 both lost more than 25% of RVH in summer 2023 cuts
+# - 714 gained >25% of min in spring 2024
+# - 4 gained >25% of min in fall 2024
+# the 34 and 441/442 changes are the ones I trust the most, but the other ones are worth an audit
+mbta_change_summaries_routelevel %>%
+  lapply(function(df) df %>% filter(abs(pct_chg_min) > 25))
+```
+
 I should have enough now to give color / interpretation of the quantity-of-service changes at least for full days. This will be a bit different from the morning peak hour changes. The only way to really filter out any "noise" would be to rerun gtfs_metrics to only pull statistics for the morning hours, but maybe the full-day statistics will be OK. 
 
-The other piece is to identify which pieces of these summaries I will actually publish. I imagine a table with each row as a change and a selection of columns for both the service changes and the access changes, and then additional color / detail in the text. 
+The other piece is to identify which pieces of these summaries I will actually publish. I imagine a table with each row as a change and a selection of columns for both the service changes and the access changes, and then additional color / detail in the text. Or maybe with 8 changes, I just do those as columns and allow myself to do (rapid transit, frequent bus, and other bus) * (trips, min, km). Then for access, I can tack on rows with the popmean change in p50 axs by race, along with the total popmean change for p15, p50, p85 axs
+
+```{r}
+extract_table_info <- function(change_name) {
+  mbta_change_summaries_highlevel[[change_name]] %>% 
+    filter(route_category %in% c('Rapid Transit', 'Frequent Bus', 'Other Bus')) %>%
+    mutate(chg = change_name)
+}
+
+service_table_info <- names(mbta_change_summaries_highlevel) %>%
+  lapply(extract_table_info) %>%
+  bind_rows() %>%
+  pivot_longer(cols=c(#'chg_trips', 'chg_min', 
+                      'pct_chg_trips', 'pct_chg_min'),
+               names_to='statistic') %>%
+  pivot_wider(id_cols=c('route_category', 'statistic'), names_from='chg', values_from='value') %>%
+  arrange(factor(route_category, levels=c('Rapid Transit', 'Frequent Bus', 'Other Bus')), desc(statistic))
+```
+
 
 # R5R Calculations
 
@@ -1177,7 +1214,7 @@ I also tried graphing the changes in population per access bin for a given chang
 
 ### Demographic breakdown visualizations
 
-average change in job access per demographic group by adjustment
+average change in job access per demographic group by adjustment. can graph before or after instead to get differences in average existing access
 
 ```{r}
 mbta_axs_changes %>%
@@ -1186,7 +1223,7 @@ mbta_axs_changes %>%
     cols=c(nh_white, nh_black, nh_aapi, nh_others, hisp_all),
     names_to = 'race', values_to = 'pop'
   ) %>% 
-  filter(pop != 0, delta_p50 != 0) %>%
+  filter(pop != 0, delta_p50 != 0, after > 100000) %>%
   # pivot_longer(
   #   cols=c(before, after),
   #   names_to = 'stage', values_to = 'access'
@@ -1194,7 +1231,8 @@ mbta_axs_changes %>%
   group_by(change_name, race) %>%
   summarise(
     mean_axs = wtd.mean(delta_p50, weights=pop),
-    stderr_axs = sqrt(wtd.var(delta_p50, weights=pop))/sqrt(sum(pop))
+    stderr_axs = sqrt(wtd.var(delta_p50, weights=pop))/sqrt(sum(pop)),
+    .gruops='drop'
     ) %>%
   ggplot(aes(fill=race, x=race, y=mean_axs)) + 
   geom_bar(position='dodge', stat='identity') +
@@ -1239,6 +1277,7 @@ axs_chgs_raceethn_aovs %>%
 
 ### Maps & Spatial Analysis
 
+TODO: plot delta_p50==0 separately with just outlines
 TODO: map of snapshot access
 TODO: map of change in 15-to-85 range
 
@@ -1247,19 +1286,22 @@ These tmap maps are useful for me as an exploration of various mappable metrics,
 ```{r}
 sf_delta_axs <- origins_i_sf %>%
   mutate(id = as.numeric(id)) %>%
-  inner_join(mbta_axs_changes %>% filter(change_name == 'Spring 2023'), by='id') %>%
-  filter(delta_p50 != 0)
+  inner_join(mbta_axs_changes, by='id') %>%
+  mutate(change_name=factor(change_name, levels=names(mbta_changes))) %>%
+  group_by(id) %>%
+  filter(sum(abs(delta_p50)) > 0)
 
 tm_shape(sf_delta_axs) +
-    tm_polygons(fill = 'delta_p50', 
-            fill.scale = tm_scale_continuous(values='brewer.rd_yl_gn'),
-            fill.legend = tm_legend("Change in Jobs Accessible"),
-            col_alpha = 0) #+
-    # tm_layout(frame = FALSE,
-    #           bg.color = "grey85",
-    #           legend.position = c("right", "bottom"),
-    #           legend.text.color = "white",
-    #           legend.title.color = "white")
+  tm_polygons(fill = 'delta_p50', 
+          fill.scale = tm_scale_continuous(values='brewer.rd_yl_gn'),
+          fill.legend = tm_legend("Change in Jobs Accessible", reverse=T),
+          col_alpha = 0) +
+  tm_facets("change_name") +
+  tm_layout(frame = FALSE,
+            bg.color = "grey85",
+            legend.outside=T,
+            legend.outside.position=c("right", "bottom")
+            )
 ```
 
 TODO: decide on adding spatial autocorrelation or other statistics to aggregate_axs()
@@ -1280,29 +1322,18 @@ aggregate_axs <- function(df) {
     summarise(
       across(total_emp_p15:total_emp_p85, ~ weighted.mean(.x, total_pop),
              .names='{.col}_popmean'),
-      across(total_emp_p15:total_emp_p85, ~ quantile(.x, probs=0.8), 
-             .names='{.col}_blockp80'),
-      across(total_emp_p15:total_emp_p85, ~ wtd.quantile(.x, weights=total_pop, probs=0.8), 
-           .names='{.col}_popp80'),
+      # across(total_emp_p15:total_emp_p85, ~ quantile(.x, probs=0.8), 
+      #        .names='{.col}_blockp80'),
+      
+      # # this one is interesting, but at lower percentiles says more about the non-MBTA areas than anything
+      # across(total_emp_p15:total_emp_p85, ~ wtd.quantile(.x, weights=total_pop, probs=0.8), 
+      #      .names='{.col}_popp80'),
+      
+      across(nh_white:hisp_all, ~ weighted.mean(total_emp_p50, .x), 
+           .names='{.col}_popmean'),
       .groups='drop'
       )
 }
-```
-
-```{r testing}
-axs_all %>%
-  group_by(service_day) %>%
-  summarise(
-    across(total_emp_p15:total_emp_p85, ~ weighted.mean(.x, total_pop), 
-           .names='{.col}_popmean'),
-    across(total_emp_p15:total_emp_p85, ~ quantile(.x, probs=0.8), 
-           .names='{.col}_blockp80'),
-    across(total_emp_p15:total_emp_p85, ~ wtd.quantile(.x, weights=total_pop, probs=0.8), 
-           .names='{.col}_popp80'),
-    .groups='drop'
-    )
-  # arrange(total_emp_p50) %>% 
-  # mutate(wtd_ptile = lag(cumsum(total_pop), default = 0)/(sum(total_pop) - 1))
 ```
 
 ```{r}
@@ -1315,7 +1346,7 @@ TODO: add additional lines and ribbons for high, medium, and low-access populati
 TODO: figure out and toggle between central-tendency lines and actual-observation lines for particular percentiles / statistics
 
 ```{r}
-metric <- 'popp80'
+metric <- 'popmean'
 
 axs_agg %>%
   mutate(service_date = as.POSIXct(strptime(as.character(service_day), '%Y%m%d'))) %>%
@@ -1335,8 +1366,9 @@ axs_agg %>%
   
 ```
 
-TODO (maybe): erase block polygons with water
-TODO: create block maps of # & % changes in access for an individual adjustment
+The reason 20230627 is so much lower than 20230321 seems to be the Red Line shuttling from Braintree to South Station that occurred on the former date, which was lifted for 20230711 but simultaneously replaced by a bunch of bus frequency cuts.
+
+
 
 ```{r figure2, fig.height=3.5, fig.width=12.5, fig.cap="\\label{fig:figure2}Figure 2. Transit Employment Accessibility Comparison", message=FALSE, warning=FALSE, echo=FALSE}
 # join results to input_sf object
