@@ -569,9 +569,25 @@ gtfs_metrics %>%
   head(15)
 ```
 
+Identify service days with suspiciously low total runtimes
+
 ```{r}
-yyyy <- 2023
-gtfs_metrics %>%
+sus_days <- gtfs_metrics %>%
+  mutate(service_dt = as.POSIXct(strptime(as.character(service_day), '%Y%m%d'))) %>%
+  filter(weekdays(service_dt) == 'Tuesday', year(service_dt) >= 2019) %>%
+  group_by(service_dt) %>%
+  summarise(total_runtime_minutes_day = sum(total_runtime_minutes)) %>%
+  filter(total_runtime_minutes_day < 300000) %>%
+  select(service_dt) %>% unique()
+```
+
+```{r}
+yyyy <- 2019
+mbta.colors <- c('Rail Replacement Bus' = "#444444", 'Rapid Transit' = "#FD8A03", 
+                 'Regional Rail' ="#82076c", 'Ferry' = "#008eaa", 
+                 'Frequent Bus' = "#9A9C9D", 'Other Bus' = "#ffc72c")
+
+gmc <- gtfs_metrics %>%
   mutate(
     service_dt = as.POSIXct(strptime(as.character(service_day), '%Y%m%d')),
     route_category = factor(case_when(
@@ -583,26 +599,33 @@ gtfs_metrics %>%
       levels=c('Rail Replacement Bus', 'Rapid Transit', 'Regional Rail', 'Ferry', 'Frequent Bus', 'Other Bus')
     )
     ) %>%
-  filter(weekdays(service_dt) == 'Tuesday', year(service_dt) == yyyy) %>%
+  filter(weekdays(service_dt) == 'Tuesday', year(service_dt) >= yyyy,
+         !(service_dt %in% sus_days$service_dt), !is.na(route_category)) %>%
   group_by(route_category, service_dt) %>%
-  summarise(across(c(num_trips, total_runtime_minutes, total_runtime_km), sum), .groups='drop') %>%
-  ggplot(aes(fill=route_category, y=total_runtime_minutes, x=as.character(service_dt))) + 
-    geom_bar(position="stack", stat="identity") + 
-    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
-    ggtitle(paste0("Total Scheduled MBTA Runtime by Route Category (Tuesdays, ", as.character(yyyy), "-present)"))
+  summarise(across(c(num_trips, total_runtime_minutes, total_runtime_km), sum), .groups='drop')
 ```
 
-Identify service days with suspiciously low total runtimes
-
-```{r}
-gtfs_metrics %>%
-  mutate(service_dt = as.POSIXct(strptime(as.character(service_day), '%Y%m%d'))) %>%
-  filter(weekdays(service_dt) == 'Tuesday', year(service_dt) >= 2019) %>%
-  group_by(service_dt) %>%
-  summarise(total_runtime_minutes_day = sum(total_runtime_minutes)) %>%
-  filter(total_runtime_minutes_day < 300000) %>%
-  select(service_dt) %>% unique()
+``` {r}
+gmc %>%
+  ggplot(aes(fill=route_category, y=total_runtime_minutes, x=service_dt)) +
+  geom_bar(position="stack", stat="identity") + 
+  scale_y_continuous(labels=comma) +
+  scale_fill_manual(values=mbta.colors) +
+  annotate("text", x=as.POSIXct('2022-07-12'), y=585000,
+           label = 'GLX Medford Opening', color='red', size=3) +
+  annotate("segment", x=as.POSIXct('2022-12-12'), y=570000, yend=490000, color='red',
+           arrow=arrow(type = "closed", length = unit(0.015, "npc"))) +
+  annotate("text", x=as.POSIXct('2024-07-15'), y=585000,
+           label = 'BNR Phase 1 Opening', color='red', size=3) +
+  annotate("segment", x=as.POSIXct('2024-12-15'), y=570000, yend=510000, color='red',
+           arrow=arrow(type = "closed", length = unit(0.015, "npc"))) +
+  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x='Service Date', y='Daily Minutes of Vehicle Runtime', fill='Route Category',
+       title=paste0("Daily Scheduled MBTA Runtime by Route Category (Tuesdays, Jan. ",
+                    as.character(yyyy), " - Jan. 2025)"))
 ```
+
+
 
 TODO: function summarizing route-level changes in service between two dates. Validation examples: 
 
@@ -748,14 +771,15 @@ mbta_change_summary <- function(change_name, by_route=FALSE) {
       chg_min = get(paste0('total_runtime_minutes_', as.character(aft_day))) - runtime_min_b4,
       chg_km = round(
         get(paste0('total_runtime_km_', as.character(aft_day))) - runtime_km_b4, 0),
-      pct_chg_trips = round(100*chg_trips / num_trips_b4, 2),
-      pct_chg_min = round(100*chg_min / runtime_min_b4, 2),
-      pct_chg_km = round(100*chg_km / runtime_km_b4, 2)
+      pct_chg_trips = round(100*chg_trips / num_trips_b4, 1),
+      pct_chg_min = round(100*chg_min / runtime_min_b4, 1),
+      pct_chg_km = round(100*chg_km / runtime_km_b4, 1)
     ) %>%
     #filter(chg_trips != 0 | chg_min != 0 | chg_km != 0) %>%
     select(
       all_of(c(agg_cols, 'chg_trips', 'chg_min', 'chg_km', 
-               'pct_chg_trips', 'pct_chg_min', 'pct_chg_km'))
+               'pct_chg_trips', 'pct_chg_min', 'pct_chg_km',
+               'num_trips_b4', 'runtime_min_b4', 'runtime_km_b4'))
     )
 }
 ```
@@ -771,11 +795,13 @@ mbta_change_summaries_routelevel <- names(mbta_changes) %>%
 ```
 
 ```{r}
-# # this confirms that the only non-temporary service change meeting the mode threshold was BNR Phase 1,
-# # and that's if you count Frequent Bus as a separate mode
-# mbta_change_summaries_highlevel %>%
-#   lapply(function(df) df %>% filter(abs(pct_chg_min) > 10))
+# this confirms that the only non-temporary service change meeting the mode threshold was BNR Phase 1,
+# and that's if you count Frequent Bus as a separate mode
+mbta_change_summaries_highlevel %>%
+  lapply(function(df) df %>% filter(abs(pct_chg_min) > 10))
+```
 
+```{r}
 # this shows that both GLX medford and BNR Phase 1 met the route-level major change threshold, but so did:
 # - route 556 with no change in trips or distance in Winter 2025
 # - blue gaining min and orange losing min in winter 2023 beyond the threshold, seemingly unannounced
@@ -790,13 +816,24 @@ mbta_change_summaries_routelevel %>%
 
 I should have enough now to give color / interpretation of the quantity-of-service changes at least for full days. This will be a bit different from the morning peak hour changes. The only way to really filter out any "noise" would be to rerun gtfs_metrics to only pull statistics for the morning hours, but maybe the full-day statistics will be OK. 
 
-The other piece is to identify which pieces of these summaries I will actually publish. I imagine a table with each row as a change and a selection of columns for both the service changes and the access changes, and then additional color / detail in the text. Or maybe with 8 changes, I just do those as columns and allow myself to do (rapid transit, frequent bus, and other bus) * (trips, min, km). Then for access, I can tack on rows with the popmean change in p50 axs by race, along with the total popmean change for p15, p50, p85 axs
+The other piece is to identify which pieces of these summaries I will actually publish. I imagine a table with each row as a change and a selection of columns for both the service changes and the access changes, and then additional color / detail in the text. Or maybe with 8 changes, I just do those as columns and allow myself to do (rapid transit, frequent bus, and other bus) * (trips, min, km). I will tack on access rows to this in the "Summary stats per change" section.
 
 ```{r}
 extract_table_info <- function(change_name) {
-  mbta_change_summaries_highlevel[[change_name]] %>% 
+  tot <- mbta_change_summaries_highlevel[[change_name]] %>%
+  summarise(route_category = 'Total', across(chg_trips:runtime_km_b4, sum)) %>%
+  mutate(pct_chg_trips = formatC(100*chg_trips / num_trips_b4, format='f', digits = 1),
+         pct_chg_min = formatC(100*chg_min / runtime_min_b4, format='f', digits = 1),
+         pct_chg_km = formatC(100*chg_km / runtime_km_b4, format='f', digits = 1))
+  
+  selected_categories <- mbta_change_summaries_highlevel[[change_name]] %>% 
     filter(route_category %in% c('Rapid Transit', 'Frequent Bus', 'Other Bus')) %>%
-    mutate(chg = change_name)
+    mutate(across(pct_chg_trips:pct_chg_km, ~ formatC(.x, format='f', digits = 1)))
+  
+  tot %>%
+    bind_rows(selected_categories) %>%
+    mutate(chg = change_name, category=route_category) %>%
+    select(-c('num_trips_b4', 'runtime_min_b4', 'runtime_km_b4'))
 }
 
 service_table_info <- names(mbta_change_summaries_highlevel) %>%
@@ -805,10 +842,13 @@ service_table_info <- names(mbta_change_summaries_highlevel) %>%
   pivot_longer(cols=c(#'chg_trips', 'chg_min', 
                       'pct_chg_trips', 'pct_chg_min'),
                names_to='statistic') %>%
-  pivot_wider(id_cols=c('route_category', 'statistic'), names_from='chg', values_from='value') %>%
-  arrange(factor(route_category, levels=c('Rapid Transit', 'Frequent Bus', 'Other Bus')), desc(statistic))
+  pivot_wider(id_cols=c('category', 'statistic'), names_from='chg', values_from='value') %>%
+  mutate(across(names(mbta_changes), ~paste0(.x, '%'))) %>%
+  arrange(
+    factor(category, levels=c('Total', 'Rapid Transit', 'Frequent Bus', 'Other Bus')),
+    desc(statistic))
 ```
-
+TODO: total pct chg in trips and minutes across route categories,
 
 # R5R Calculations
 
@@ -1061,19 +1101,15 @@ axs_dfs <- names(mbta_analysis_lookup) %>%
   `names<-`(names(mbta_analysis_lookup))
 ```
 
-Get race/ethn data and join that in too
+Get race/ethn data, clean it, and join it in
 
 ```{r}
 ma_blocks_raceethn <- read.csv(paste0(data_path, '/raceethn_2020_block_MA.csv'))
-```
 
-```{r}
 block_raceethn <- ma_blocks_raceethn %>%
   mutate(block_id = as.numeric(substr(GEOID, 10, length(GEOID)))) %>%
   select(block_id, nh_white, nh_black, nh_aapi, nh_others, hisp_all)
-```
 
-```{r}
 block_pops <- mbta_cb_poly %>%
   st_drop_geometry() %>%
   rename(id = all_of(origins_id_field)) %>%
@@ -1090,9 +1126,7 @@ axs_all <- axs_dfs %>%
   inner_join(block_pops, by='id')
 ```
 
-### Compare distributions of access changes
-
-As a prerequisite, we create dataframes of the before-and-after for each change
+Create dataframes of the before-and-after for each change
 
 ```{r}
 # for each mbta_change to consider, create a before and after and then stack?
@@ -1103,16 +1137,24 @@ chg_axs <- function(chg_name) {
     mutate(period = case_when(
       service_day == mbta_changes[[chg_name]][2] ~ 'after',
       .default='before')) %>%
+    pivot_longer(cols=total_emp_p15:total_emp_p85, names_to='tod_ptile', values_to='axs') %>%
+    mutate(tod_ptile=substr(tod_ptile, 11, 14)) %>% # e.g., "total_emp_p50" -> "p50"
     pivot_wider(
-      id_cols=c('id', 'total_pop', 'nh_white', 'nh_black', 'nh_aapi', 'nh_others', 'hisp_all'), 
+      id_cols=c('id', 'total_pop', 'nh_white', 'nh_black', 'nh_aapi', 
+                'nh_others', 'hisp_all', 'tod_ptile'), 
       names_from='period', 
-      values_from='total_emp_p50') %>%
-    mutate(change_name = chg_name, delta_p50 = after - before,
-           access_bin_before = before - (before %% 10000),
-          access_bin_after = after - (after %% 10000)) %>%
-    arrange(before) %>%
+      values_from='axs') %>%
+    mutate(change_name = chg_name, delta = after - before,
+             access_bin_before = before - (before %% 10000),
+            access_bin_after = after - (after %% 10000)) %>%
+    pivot_wider(id_cols=c('change_name', 'id', 'total_pop', 'nh_white', 
+                          'nh_black', 'nh_aapi', 'nh_others', 'hisp_all'),
+                names_from='tod_ptile', 
+                values_from=c('before', 'after', 'delta', 
+                              'access_bin_before', 'access_bin_after')) %>%
+    arrange(before_p50) %>%
     mutate(pop_pctile_before = lag(cumsum(total_pop), default = 0)/(sum(total_pop) - 1)) %>%
-    arrange(after) %>%
+    arrange(after_p50) %>%
     mutate(pop_pctile_after = lag(cumsum(total_pop), default = 0)/(sum(total_pop) - 1)) %>%
     mutate(delta_pop_pctile = pop_pctile_after - pop_pctile_before)
 }
@@ -1122,14 +1164,13 @@ mbta_axs_changes <- names(mbta_changes) %>%
   bind_rows()
 ```
 
-TODO: create separate chart or option for comparing change distributions by TOD ptile
-TODO: look into statistics that would capture different kinds of distributions, which I could report alongside the total number of affected population
+### Compare distributions of access changes
 
 The viz below compares the distributions of changes across scenarios. It shows that most of the distributions are quite similar, with all but GLX Medford Opening having a mix of winners and losers with tails leaning in the direction of the service changes.  I'm not sure if any of these will make it into the final paper, given that the untransformed-axis charts make it hard to compare across adjustments, while the transformed-axis charts imply a bimodal distribution that isn't really there. 
 
 ```{r}
 # the first element of this will be plotted first (back), then the next overlaid in front of it, etc 
-adjustments_to_plot <- c('Winter 2025 (BNR Phase 1)', 'Summer 2023', 'GLX Medford Opening')
+adjustments_to_plot <- c('Winter 2025 (BNR Phase 1)', 'Spring 2024', 'GLX Medford Opening')
 #pseudolog10_breaks <- c(-1*(10^seq(1,5, by=1)), 10^seq(1,5, by=1))
 
 mbta_axs_changes %>%
@@ -1168,10 +1209,10 @@ mbta_axs_changes %>%
   filter(change_name %in% adjustments_to_plot) %>%
   mutate(#pop_ptile_b4_bin = round(pop_pctile_before*100),
          change_name = factor(change_name, levels=adjustments_to_plot)) %>%
-  group_by(change_name, access_bin_before) %>%
+  group_by(change_name, access_bin_before_p50) %>%
   summarise(chg_personjob_access = sum(total_pop * delta_p50), .groups='drop') %>%
   ggplot() + 
-  geom_col(aes(x=access_bin_before, y=chg_personjob_access, fill=as.factor(change_name)),
+  geom_col(aes(x=access_bin_before_p50, y=chg_personjob_access, fill=as.factor(change_name)),
            alpha=.5, position='identity') +
   scale_x_continuous(label=comma) + 
   scale_y_continuous(label=comma) +
@@ -1181,7 +1222,7 @@ mbta_axs_changes %>%
        title='Changes in Population-Weighted Jobs Accessible by Pre-Adjustment Access Level')
 ```
 
-Substituting pop_ptile_b4_bin for access_bin shows that >50% of the population of the 7 MA counties in my analysis have access to <10k jobs via MBTA+walk, and see barely any changes because those jobs are probably all walk and they're far away from MBTA service. I could conceivably do a post-hoc filter for blocks within a mile or two of MBTA stops, and that would be a better method for comparability across metros, but whatever filter I apply would both not fully solve that chart problem and be somewhat arbitrary.
+Substituting pop percentile bins for access bins shows that >50% of the population of the 7 MA counties in my analysis have access to <10k jobs via MBTA+walk, and see barely any changes because those jobs are probably all walk and they're far away from MBTA service. I could conceivably do a post-hoc filter for blocks within a mile or two of MBTA stops, and that would be a better method for comparability across metros, but whatever filter I apply would both not fully solve that chart problem and be somewhat arbitrary.
 
 I also tried graphing the changes in population per access bin for a given change ("an additional x people joined the cohort of people with access to y jobs or more") but it ends up looking like radio spaghetti due to populations moving from one group to another showing up as losses / gains in adjacent bins. I'm saving it as optional code in case some derivative of this becomes interesting, but I doubt it.
 
@@ -1212,9 +1253,77 @@ I also tried graphing the changes in population per access bin for a given chang
 #        title='Changes in Population by Access Level')
 ```
 
+### Summary stats per change
+
+TODO: look into statistics that would capture different kinds of distributions, which I could report alongside the total number of affected population
+
+TODO: 
+- add total affected pop & avg or total change in access per pre-existing access bin (not population ntile)
+
+```{r}
+access_table_info <- mbta_axs_changes %>%
+  # mutate to add
+  group_by(change_name) %>%
+  summarise(
+    total_affected_pop = sum(case_when(delta_p50 != 0 ~ total_pop, .default=0)),
+    across(before_p15:before_p85, ~ weighted.mean(.x, total_pop),
+           .names='popmean_{.col}'),
+    across(delta_p15:delta_p85, ~ weighted.mean(.x, total_pop),
+           .names='popmean_{.col}'),
+    across(delta_p15:delta_p85, ~ sqrt(wtd.var(.x, total_pop)),
+           .names='popstdev_{.col}'),
+    across(nh_white:hisp_all, ~ weighted.mean(before_p50, .x), 
+         .names='popmean_before_{.col}'),
+    across(nh_white:hisp_all, ~ weighted.mean(delta_p50, .x), 
+         .names='popmean_delta_{.col}'),
+    across(nh_white:hisp_all, ~ sqrt(wtd.var(delta_p50, .x)), 
+         .names='popstdev_delta_{.col}'),
+    .groups='drop'
+  ) %>%
+  pivot_longer(cols=total_affected_pop:popstdev_delta_hisp_all, names_to = 'category') %>%
+  mutate(statistic = case_when(str_detect(category, "before") ~ 'before',
+                              str_detect(category, "popmean_delta") ~ 'popmean_delta',
+                              str_detect(category, "popstdev_delta") ~ 'popstdev_delta',
+                              .default='standalone'),
+         category = case_when(
+           str_detect(category, "before") ~ str_replace(category, 'popmean_before_', ''),
+           str_detect(category, "popmean_delta") ~ str_replace(category, 'popmean_delta_', ''),
+           str_detect(category, "popstdev_delta") ~ str_replace(category, 'popstdev_delta_', ''),
+           .default=category)) %>%
+  pivot_wider(id_cols=c(change_name, category), names_from=statistic, values_from=value) %>%
+  mutate(pct_chg = popmean_delta/before, pct_stdev = popstdev_delta/before,
+         formatted = ifelse(is.na(pct_chg), NA, paste0(
+           as.character(formatC(100*pct_chg, format='f', digits = 1)), '% (', 
+           as.character(formatC(100*pct_stdev, format='f', digits = 1)), '%)'
+           )),
+         standalone = ifelse(is.na(standalone), NA,
+                             prettyNum(standalone, big.mark=",", preserve.width="none")
+                             )) %>%
+  pivot_longer(cols=c(standalone, formatted), 
+               names_to = 'statistic', values_drop_na = TRUE) %>%
+  
+  # # OPTIONAL: also calculate the ratio between p85 and p15 - could be calculated post-hoc too
+  # pivot_wider(id_cols=c('change_name', 'statistic'), 
+  #             names_from='category', values_from='value') %>%
+  # mutate(ratio_p85_p15 = ifelse(p15 == 0, NA, p85 / p15)) %>%
+  # pivot_longer(cols=c(p15:ratio_p85_p15), names_to = 'category') %>%
+  
+  pivot_wider(id_cols=c('statistic', 'category'), names_from='change_name',
+              values_from='value') %>%
+  select(category, statistic, all_of(names(mbta_changes)))
+```
+
+```{r}
+service_table_info %>%
+  bind_rows(access_table_info) %>%
+  write.csv(paste0(outputs_path, '/summary_table.csv'), row.names=F)
+```
+
 ### Demographic breakdown visualizations
 
 average change in job access per demographic group by adjustment. can graph before or after instead to get differences in average existing access
+
+TODO: version by white/nonwhite only to reflect Title VI requirement
 
 ```{r}
 mbta_axs_changes %>%
@@ -1289,30 +1398,34 @@ sf_delta_axs <- origins_i_sf %>%
   inner_join(mbta_axs_changes, by='id') %>%
   mutate(change_name=factor(change_name, levels=names(mbta_changes))) %>%
   group_by(id) %>%
-  filter(sum(abs(delta_p50)) > 0)
+  filter(sum(abs(delta_p50)) > 0) %>%
+  mutate(delta_p50 = case_when(delta_p50 == 0 ~ NA, .default=delta_p50))
+```
 
+``` {r}
 tm_shape(sf_delta_axs) +
-  tm_polygons(fill = 'delta_p50', 
-          fill.scale = tm_scale_continuous(values='brewer.rd_yl_gn'),
-          fill.legend = tm_legend("Change in Jobs Accessible", reverse=T),
+  tm_polygons(fill = 'delta_p50',  
+          fill.scale = tm_scale_continuous_pseudo_log(
+            values='brewer.prgn', values.range = c(0, 1), base=2, sigma=20000,
+            value.na = 'grey75', label.na = "Gray = Zero Change",
+            ticks = c(-300000, -30000, 0, 30000, 300000)
+            ), # rd_yl_gn
+          fill.legend = tm_legend("Change in Job Access", reverse=TRUE, item.height=5),
           col_alpha = 0) +
-  tm_facets("change_name") +
+  tm_facets("change_name", scale.factor=3) +
   tm_layout(frame = FALSE,
             bg.color = "grey85",
-            legend.outside=T,
-            legend.outside.position=c("right", "bottom")
+            legend.outside = TRUE
             )
 ```
 
 TODO: decide on adding spatial autocorrelation or other statistics to aggregate_axs()
 
-### Summary statistics across adjustments
+### Summary stats across dates
 
 TODO: add summary statistics of social and geographic equity
 - then, group befores, afters, and changes by race/ethn and do stderr / anova / tukey
-- do mean & stderr charts by race/ethn
 - then add gini & palma to aggregate_axs()
-
 
 ```{r}
 aggregate_axs <- function(df) {
@@ -1342,8 +1455,7 @@ axs_agg <- axs_dfs %>%
   bind_rows()
 ```
 
-TODO: add additional lines and ribbons for high, medium, and low-access population percentiles (or whatever categories make sense)
-TODO: figure out and toggle between central-tendency lines and actual-observation lines for particular percentiles / statistics
+TODO: directly plot the change in 15-85 range over time (try absolute & pct)
 
 ```{r}
 metric <- 'popmean'
