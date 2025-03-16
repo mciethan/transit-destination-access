@@ -625,13 +625,6 @@ gmc %>%
                     as.character(yyyy), " - Jan. 2025)"))
 ```
 
-
-
-TODO: function summarizing route-level changes in service between two dates. Validation examples: 
-
-https://www.reddit.com/r/mbta/comments/znq2l2/this_winter_the_mbta_has_cut_and_reduced_service/?rdt=59724 
-https://www.reddit.com/r/mbta/comments/11n00vr/mbta_to_cut_spring_2023_weekday_service_on_the/
-
 ```{r}
 year <- 2024
 test_query <- paste0("
@@ -1145,13 +1138,14 @@ chg_axs <- function(chg_name) {
       names_from='period', 
       values_from='axs') %>%
     mutate(change_name = chg_name, delta = after - before,
-             access_bin_before = before - (before %% 10000),
-            access_bin_after = after - (after %% 10000)) %>%
+           access_bin_before = before - (before %% 10000),
+           access_bin_after = after - (after %% 10000)) %>%
     pivot_wider(id_cols=c('change_name', 'id', 'total_pop', 'nh_white', 
                           'nh_black', 'nh_aapi', 'nh_others', 'hisp_all'),
                 names_from='tod_ptile', 
                 values_from=c('before', 'after', 'delta', 
                               'access_bin_before', 'access_bin_after')) %>%
+    mutate(non_white = nh_black + nh_aapi + nh_others + hisp_all) %>%
     arrange(before_p50) %>%
     mutate(pop_pctile_before = lag(cumsum(total_pop), default = 0)/(sum(total_pop) - 1)) %>%
     arrange(after_p50) %>%
@@ -1323,16 +1317,23 @@ service_table_info %>%
 
 average change in job access per demographic group by adjustment. can graph before or after instead to get differences in average existing access
 
-TODO: version by white/nonwhite only to reflect Title VI requirement
+TODO: version by white/nonwhite only to reflect Title VI requirement; clean up axes
 
 ```{r}
 mbta_axs_changes %>%
   mutate(change_name = factor(change_name, levels=names(mbta_changes))) %>%
   pivot_longer(
-    cols=c(nh_white, nh_black, nh_aapi, nh_others, hisp_all),
+    cols=c(non_white, # OPTION 1: combine all non-white
+           # nh_black, nh_aapi, nh_others, hisp_all, # OPTION 2: 5 major race/ethn groups
+           nh_white),
     names_to = 'race', values_to = 'pop'
   ) %>% 
-  filter(pop != 0, delta_p50 != 0, after > 100000) %>%
+  mutate(
+    race = case_match(race, 
+                      'nh_white' ~ 'White (non-Hispanic)', 
+                      'non_white' ~ 'Non-white (or Hispanic of any race)')
+  ) %>%
+  filter(pop != 0, delta_p50 != 0) %>%
   # pivot_longer(
   #   cols=c(before, after),
   #   names_to = 'stage', values_to = 'access'
@@ -1345,8 +1346,15 @@ mbta_axs_changes %>%
     ) %>%
   ggplot(aes(fill=race, x=race, y=mean_axs)) + 
   geom_bar(position='dodge', stat='identity') +
+  scale_y_continuous(labels=comma) +
+  geom_hline(yintercept=0, linewidth=0.2) +
   #geom_bar(position=position_dodge(width=0.9)) +
-  geom_errorbar(aes(ymax=mean_axs + stderr_axs, ymin = mean_axs - stderr_axs), position=position_dodge(width=0.9), width=0.25) + 
+  geom_errorbar(aes(ymax=mean_axs + stderr_axs, ymin = mean_axs - stderr_axs), 
+                position=position_dodge(width=0.9), width=0.25) + 
+  labs(x='', fill='', y='Change in Jobs Reachable in 60 min. via transit + walk',
+       title='Average Changes in Job Access by Race & Ethnicity for MBTA Service Changes') +
+  theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+        legend.position = "top") +
   facet_wrap(vars(change_name))
 ```
 
@@ -1364,7 +1372,9 @@ named_group_split <- function(.tbl, ...) {
 
 axs_chgs_raceethn_aovs <- mbta_axs_changes %>%
   pivot_longer(
-    cols=c(nh_white, nh_black, nh_aapi, nh_others, hisp_all),
+    cols=c(non_white, # OPTION 1: combine all non-white
+           # nh_black, nh_aapi, nh_others, hisp_all, # OPTION 2: 5 major race/ethn groups
+           nh_white),
     names_to = 'race', values_to = 'pop'
   ) %>% 
   filter(pop != 0, delta_p50 != 0) %>%
@@ -1479,84 +1489,3 @@ axs_agg %>%
 ```
 
 The reason 20230627 is so much lower than 20230321 seems to be the Red Line shuttling from Braintree to South Station that occurred on the former date, which was lifted for 20230711 but simultaneously replaced by a bunch of bus frequency cuts.
-
-
-
-```{r figure2, fig.height=3.5, fig.width=12.5, fig.cap="\\label{fig:figure2}Figure 2. Transit Employment Accessibility Comparison", message=FALSE, warning=FALSE, echo=FALSE}
-# join results to input_sf object
-input_sf_accessibility <- left_join(origins_i_sf, accessibility, by=c("id" = "fromId"))
-
-# iterate through selected functions to create maps
-accessibility_maps <- list()
-
-for (i in selected_f){
-  map <- tm_shape(input_sf_accessibility) +
-    tm_fill(col = i, 
-            title = i, 
-            style = "cont", 
-            palette = "viridis") + 
-    tm_layout(frame = FALSE,
-              bg.color = "grey85",
-              legend.position = c("left", "top"),
-              legend.text.color = "white",
-              legend.title.color = "white")
-  
-  accessibility_maps[[i]] <- map}
-
-names(accessibility_maps) <- selected_f
-
-# plot the maps
-tmap_arrange(accessibility_maps)
-```
-
-Similar to Kwan (1998) and Vale and Pereira (2017), correlations in accessibility across measures are generally strong (Figure 3), indicating many capture similar spatial processes. Of those used in Figures 1 and 2 for example, results from the negative exponential (`EXP0_15`), modified Gaussian (`MGAUS180`), cumulative rectangular (`CUMR40`), and cumulative linear (`CUML40`) measures of impedance all show correlation coefficients of at least 0.75. In particular, the correlation between the `EXP0_15` and `MGAUS180` measures is 0.99. Results from the inverse power (`POW2_0`) measure are more unique, with correlations ranging from 0.72 to 0.85. It should be emphasized that such outcomes are not a product of similar functional forms alone; rather, the correlations reflect an interaction between the different impedance measures and the spatial distribution of opportunities on the travel network in the study area. Furthermore, absolute accessibility totals differ across each, suggesting the choice of a suitable impedance function and specification remains an important issue that should be guided by theory and assumptions about travel behavior.
-
-```{r figure3, fig.height=10, fig.width=10, fig.cap="\\label{fig:figure3}Figure 3. Impedance Measure Correlations", warning = FALSE, echo=FALSE}
-# create dataframe of variables for correlation analysis
-correlations <- input_sf_accessibility %>% select(all_of(selected_f)) %>% st_drop_geometry() %>% drop_na() %>% cor(.)
-
-corrplot(correlations,
-         method = "color", # corrplot method
-         type = "upper", # upper triangle matrix
-         addCoef.col = "white", # correlation text colour
-         number.cex = 0.8, # correlation text size
-         tl.col = "black", # text label colour
-         tl.srt = 45, # text label angle
-         tl.cex = 0.9, # text label size
-         cl.lim = c(min(correlations), 1), # colour label limits
-         #diag = FALSE, # turn off diagonal
-         is.corr=FALSE, # because all coefficients are positive
-         col = viridis::viridis(100)) # custom colour scheme based on viridis hex values
-```
-
-While the focus on walking and transit trips in this sample analysis does not provide a full picture of travel behavior in the study area, the `r5r` package enables users to run multiple analyses for different travel modes. Moreover, the R notebook can be utilized to select or customize the implemented impedance measures in accordance with expectations about travel behavior for each mode. Taken together, this toolbox enables researchers and practitioners to make better decisions about the specification and customization of travel impedance and simplify the calculation of place-based accessibility for their study context.
-
-# REFERENCES
-
-Fotheringham, A. S., & O’Kelly, M. E. (1989). *Spatial interaction models: Formulations and applications*. Boston: Kluwer Academic.
-
-Geurs, K. T., & Van Wee, B. (2004). Accessibility evaluation of land-use and transport strategies: review and research directions. *Journal of Transport Geography*, 12(2), 127-140. https://doi.org/10.1016/j.jtrangeo.2003.10.005
-
-Handy, S. L., & Niemeier, D. A. (1997). Measuring accessibility: An exploration of issues and alternatives. *Environment and Planning A*, 29(7), 1175-1194. https://doi.org/10.1068%2Fa291175
-
-Hansen, W. G. (1959). How accessibility shapes land use. *Journal of the American Institute of Planners*, 25(2), 73-76. https://doi.org/10.1080/01944365908978307
-
-Ingram, D. R. (1971). The concept of accessibility: A search for an operational form. *Regional Studies*, 5(2), 101-107. https://doi.org/10.1080/09595237100185131
-
-Kwan, M. P. (1998). Space‐time and integral measures of individual accessibility: A comparative analysis using a point‐based framework. *Geographical Analysis*, 30(3), 191-216. https://doi.org/10.1111/j.1538-4632.1998.tb00396.x
-
-Martínez, L. M., & Viegas, J. M. (2013). A new approach to modelling distance-decay functions for accessibility assessment in transport studies. *Journal of Transport Geography*, 26, 87-96. https://doi.org/10.1016/j.jtrangeo.2012.08.018
-
-Páez, A., Scott, D. M., & Morency, C. (2012). Measuring accessibility: Positive and normative implementations of various accessibility indicators. *Journal of Transport Geography*, 25, 141-153. https://doi.org/10.1016/j.jtrangeo.2012.03.016
-
-Reggiani, A., Bucci, P., & Russo, G. (2011). Accessibility and impedance forms: empirical applications to the German commuting network. *International Regional Science Review*, 34(2), 230-252. https://doi.org/10.1177/0160017610387296
-
-Sen, A., & Smith, T. E. (1995). *Gravity models of spatial interaction behavior*. Berlin: Springer-Verlag.
-
-Stewart, J. Q. (1948). Demographic gravitation: evidence and applications. *Sociometry*, 11(1/2), 31-58. https://doi.org/10.2307/2785468
-
-Vale, D. S., & Pereira, M. (2017). The influence of the impedance function on gravity-based pedestrian accessibility measures: A comparative analysis. *Environment and Planning B: Urban Analytics and City Science*, 44(4), 740-763. https://doi.org/10.1177%2F0265813516641685
-
-Wilson, A. G. (1971). A family of spatial interaction models, and associated developments. *Environment and Planning A*, 3(1), 1-32. https://doi.org/10.1068/a030001
-
-Zipf, G. K. (1949). *Human behavior and the principle of least effort*. Cambridge: Addison-Wesley.
