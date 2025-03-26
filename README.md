@@ -1,5 +1,21 @@
 # transit-destination-access
 
-How much opportunity can people reach using public transit, and what factors change that access over time? This analysis measures destination access via public transit for several US metro areas over a decade. We also explore which kinds of land use and transportation policies have the greatest influence on destination access via transit using counterfactual scenarios.
+Data processing and analysis for "Measuring the Destination Access Impacts of 
+Public Transit Service Adjustments", a research project I completed in spring
+2025 in partial fulfillment of my MS in Urban Informatics at Northeastern University.
 
-Maybe I need a different project name though given the likely focus on GTFS and measuring intra-year sensitivity of access measures to service adjustments. Heck, depending on what kind of literature using GTFS feeds is out there, the central concept of the project may change from destination access to service adjustments.
+[add link to full report when available]
+
+### Key Data Sources
+
+- public transit schedules in General Transit Feed Specification (GTFS) format
+- total population per census block from decennial US census
+- total jobs per census block from US Census LODES program
+- OpenStreetMap travel network data
+
+### Key Methods
+
+- daily "quantity-of-service" calculations (e.g., total trips, revenue vehicle hours & kilometers) using SQL queries on GTFS feeds
+- origin-destination network analysis (transit + walking) using `r5r` package
+- destination access measures using `accessibility` package
+
