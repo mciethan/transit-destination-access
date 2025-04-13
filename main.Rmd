@@ -1,18 +1,12 @@
 ---
-title: "Accessibility Calculator for R"
+title: "Measuring the Destination Access Impacts of Public Transit Service Adjustments"
 author:
-  - name: "Christopher D. Higgins"
-    email: cd.higgins@utoronto.ca
-    affiliation: University of Toronto
+  - name: "Ethan McIntosh"
+    affiliation: Northeastern University
+date: '2025-04-23'
 ---
 
-Template source: https://github.com/higgicd/Accessibility_Toolbox/
-
-# ABSTRACT
-Analyses of place-based accessibility undertaken in the popular ArcGIS environment require many time-consuming and tedious steps. Moreover, questions persist over the selection of an impedance function and cost or cut-off parameters. In response, this paper details a new Accessibility Toolbox for R and ArcGIS that includes a Python tool for conducting accessibility analyses and an interactive R Notebook that enables the visualization and customization of impedance functions and parameters. Using this toolbox, researchers and practitioners can simplify their accessibility analysis workflow and make better decisions about the specification and customization of travel impedance for their study context.
-
-# KEYWORDS
-accessibility, spatial interaction, travel behavior, travel impedance, distance decay function
+Note: some elements of this script were adapted from the Accessibility Calculator for R developed by Christopher Higgins at https://github.com/higgicd/Accessibility_Toolbox/
 
 ```{r setup, include=FALSE}
 # the r5r package requires installation of Java Development Kit version 21
@@ -21,22 +15,16 @@ accessibility, spatial interaction, travel behavior, travel impedance, distance 
 # assign memory for r5r to work with
 options(java.parameters = "-Xmx6G") 
 
-# load packages
-library(corrplot)
-library(httr) # to pull Transitland API data with GET requests
-library(jsonlite)
-library(knitr)
+# load other packages
 library(lehdr) # for pulling US Census LODES data
 library(tigris) # for pulling US Census shapefiles
 library(tidyverse) # for tidy functions and syntax
 library(fs) # for file path operations
 library(r5r) # for calculating travel time matrices over transportation networks
-library(sf)
-library(tmap)
-library(tidycensus)
-library(tidytransit)
+library(sf) # for geospatial data processing
+library(tmap) # for mapping
 library(viridis)
-library(progress)
+library(progress) # for progress bars
 library(arrow) # for batched read + write + transform of parquet files on disk
 library(duckdb) # for querying MBTA LAMP
 library(accessibility) # for calculating destination access measures
@@ -46,238 +34,12 @@ library(Hmisc) # for wtd.quantile function
 # setup options
 tmap_mode("plot")
 
-# setup keys, creating or editing .Renviron file as needed 
-# Guidance on .Renviron: https://laurenilano.com/posts/api-keys/#creating-the-.renviron-file
-census_api_key(Sys.getenv("CENSUS_API_KEY")) # get from https://api.census.gov/data/key_signup.html
-interline_token <- Sys.getenv("OSM_KEY") # for OSM extract from https://www.interline.io/osm/extracts/
-transitland_key <- Sys.getenv("TRANSITLAND_KEY") # to get GTFS feeds from Transitland (https://www.transit.land/terms)
-
 # create data directories (does not overwrite if these folders are already present)
 data_path <- dir_create("./data") # for storing input data
 outputs_path <- dir_create("./outputs") # for storing output data
 ttm_path <- dir_create("./r5_ttm") # for storing od matrix
 r5_path <- dir_create("./r5_graph") # for the r5 network graph
 ```
-
-# RESEARCH QUESTIONS AND HYPOTHESES
-Accessibility can be defined as the potential for reaching spatially distributed opportunities while considering the difficulty involved in traveling to them (Páez, Scott, and Morency, 2012). Several families of accessibility measures have been established since the pioneering work of Hansen (1959), including infrastructure-based, person-based, place-based, and utility-based (Geurs and van Wee, 2004). Of these, place-based measures are arguably the most common and can be operationalized as:
-
-$$
-A_i = \sum_{j}{O_jf(t_{ij})}
-$$
-where the accessibility $A$ of origin $i$ is the sum of all opportunities $O$ available at destinations $j$ weighted by some function of the travel time $t_{ij}$ between $i$ and $j$.
-
-Despite several decades of research into place-based accessibility, researchers, students, and practitioners interested in accessibility analysis face practical and empirical challenges. On the practical side, compared to simple isochrones, analyses of spatial interaction undertaken in the popular ArcGIS environment require many time-consuming and tedious steps. On the empirical side, questions persist over the selection of an impedance function and cost or cut-off parameters. Ideally, these statistical parameters should be derived from calibrated trip generation models, but in the absence of such data, Kwan (1998) argues that the use of customized functions and parameters based on theory is preferable to arbitrary assignment.
-
-To promote a more "accessible" solution for accessibility analyses, this paper details a new Accessibility Toolbox for R and ArcGIS. The Python toolbox for ArcGIS simplifies the steps involved in a place-based accessibility workflow and comes coded with 5 impedance functions and 28 impedance measures for accessibility calculation. The interactive R Notebook version of this paper visualizes the function families and specifications and allows users to customize their parameters in accordance with theory and experience with their study area. These parameters can then be implemented in the ArcGIS tool’s Python code.
-
-# IMPEDANCE FUNCTIONS
-The accessibility toolbox implements the five different impedance functions from Kwan (1998):
-
-$$
-\begin{aligned}
-  \text{Inverse Power: } &f(t_{ij})= \left\{
-      \begin{array}{ll}
-          1 & \quad \text{for }t_{ij} < 1 \\
-          t_{ij}^{-\beta} & \quad \text{otherwise}
-      \end{array}
-    \right.\\
-  \text{Negative Exponential: } &f(t_{ij}) = e^{(-\beta t_{ij})} \\
-  \text{Modified Gaussian: } &f(t_{ij})= e^{(-t_{ij}^2/\beta)} \\
-  \text{Cumulative Opportunities Rectangular: } &f(t_{ij})= \left\{
-      \begin{array}{ll}
-          1 & \quad \text{for }t_{ij} \leq \bar{t} \\
-          0 & \quad \text{otherwise}
-      \end{array}
-    \right.\\
-  \text{Cumulative Opportunities Linear: } &f(t_{ij})= \left\{
-      \begin{array}{ll}
-          (1-t_{ij}/\bar{t}) & \quad \text{for }t_{ij} \leq \bar{t} \\
-          0 & \quad \text{otherwise}
-      \end{array}
-    \right.
-\end{aligned}
-$$
-
-The inverse power, negative exponential, and modified Gaussian functions continuously discount the weight of opportunities as travel time increases using an impedance parameter $\beta$ that accounts for the cost of travel.
-
-```{r travel time, echo=FALSE}
-# first define the travel time increment, in this case from 0 to 60 minutes
-t_ij <- data.frame(t_ij = seq(from = 0, to = 60, by=1))
-```
-
-With a foundation in early gravity models of spatial interaction (e.g. Stewart, 1948; Zipf, 1949), the inverse power function produces a rapid decline in the weight of opportunities as travel time increases. While power functions draw analogs to Newtonian physics, their theoretical relevance to human travel behavior has been questioned (Sen and Smith, 1995).
-
-```{r inverse power function, echo=FALSE}
-power_f <- function(t_ij,b0){case_when(t_ij < 1 ~ 1,
-                                       TRUE ~ t_ij^-b0)}
-
-POW <- list(POW0_8 = function(t_ij){power_f(t_ij, b0 = 0.8)},
-            POW1_0 = function(t_ij){power_f(t_ij, b0 = 1.0)},
-            POW1_5 = function(t_ij){power_f(t_ij, b0 = 1.5)},
-            POW2_0 = function(t_ij){power_f(t_ij, b0 = 2.0)},
-            POW_CUS = function(t_ij){power_f(t_ij, b0 = 0.5)}) # custom - set your own parameter
-
-# plot different normalized functions
-ggplot((t_ij), aes(t_ij)) +
-  stat_function(fun=POW$POW0_8, aes(colour="POW0_8"), size=1) +
-  stat_function(fun=POW$POW1_0, aes(colour="POW1_0"), size=1) +
-  stat_function(fun=POW$POW1_5, aes(colour="POW1_5"), size=1) +
-  stat_function(fun=POW$POW2_0, aes(colour="POW2_0"), size=1) +
-  stat_function(fun=POW$POW_CUS, aes(colour="POW_CUS"), size=1, linetype="dashed") +
-  scale_color_discrete(limits = names(POW)) +
-  xlab("travel time (minutes)") +
-  scale_x_continuous(breaks = seq(min(t_ij), max(t_ij), by = 10)) +
-  ylab("impedance weight") + 
-  scale_y_continuous(breaks = seq(0, 1, by = 0.25)) +
-  theme(legend.position = c(.95, .95),
-  legend.justification = c("right", "top"),
-  legend.title = element_blank()) +
-  labs(title = "Inverse Power Function")
-```
-
-The negative exponential function is more gradual and based on its strong theoretical foundations in entropy maximization (Wilson, 1971) and choice behavior theory (Fotheringham and O’Kelly, 1989), this function appears to have become somewhat of a de-facto standard in applied accessibility analysis.
-
-```{r negative exponential function, echo=FALSE}
-neg_exp_f = function(t_ij,b0){exp(-b0*t_ij)}
-
-NEG_EXP <- list(EXP0_12 = function(t_ij){neg_exp_f(t_ij, b0 = 0.12)},
-                EXP0_15 = function(t_ij){neg_exp_f(t_ij, b0 = 0.15)},
-                EXP0_22 = function(t_ij){neg_exp_f(t_ij, b0 = 0.22)},
-                EXP0_45 = function(t_ij){neg_exp_f(t_ij, b0 = 0.45)},
-                EXP_CUS = function(t_ij){neg_exp_f(t_ij, b0 = 0.10)}, # custom - set your own parameter
-                HN1997 = function(t_ij){neg_exp_f(t_ij, b0 = 0.1813)}) # from Handy and Niemeier (1997)
-
-# plot different normalized functions
-ggplot((t_ij), aes(t_ij)) +
-  stat_function(fun=NEG_EXP$EXP0_12, aes(colour="EXP0_12"), size=1) +
-  stat_function(fun=NEG_EXP$EXP0_15, aes(colour="EXP0_15"), size=1) +
-  stat_function(fun=NEG_EXP$EXP0_22, aes(colour="EXP0_22"), size=1) +
-  stat_function(fun=NEG_EXP$EXP0_45, aes(colour="EXP0_45"), size=1) +
-  stat_function(fun=NEG_EXP$EXP_CUS, aes(colour="EXP_CUS"), size=1, linetype="dashed") +
-  stat_function(fun=NEG_EXP$HN1997, aes(colour="HN1997"), size=1, linetype="longdash") +
-  scale_color_discrete(limits = names(NEG_EXP)) +
-  xlab("travel time (minutes)") +
-  scale_x_continuous(breaks = seq(min(t_ij), max(t_ij), by = 10)) +
-  ylab("impedance weight") + 
-  scale_y_continuous(breaks = seq(0, 1, by = 0.25)) +
-  theme(legend.position = c(.95, .95),
-  legend.justification = c("right", "top"),
-  legend.title = element_blank()) +
-  labs(title = "Negative Exponential Function")
-```
-
-The modified Gaussian function exhibits a much more gradual rate of decline around its origin and a slower rate of decline overall. While Ingram (1971) argues these properties make the function superior to its inverse power and negative exponential counterparts for explaining observed travel behavior, it appears rarely used in the applied literature.
-
-```{r modified gaussian function, echo=FALSE}
-mgaus_f = function(t_ij,b0){exp(-t_ij^2/b0)}
-
-MGAUS <- list(MGAUS10 = function(t_ij){mgaus_f(t_ij, b0 = 10)},
-              MGAUS40 = function(t_ij){mgaus_f(t_ij, b0 = 40)},
-              MGAUS100 = function(t_ij){mgaus_f(t_ij, b0 = 100)},
-              MGAUS180 = function(t_ij){mgaus_f(t_ij, b0 = 180)},
-              MGAUSCUS = function(t_ij){mgaus_f(t_ij, b0 = 360)}) # custom - set your own parameter
-
-# plot different normalized functions
-ggplot((t_ij), aes(t_ij)) +
-  stat_function(fun=MGAUS$MGAUS10, aes(colour="MGAUS10"), size=1) +
-  stat_function(fun=MGAUS$MGAUS40, aes(colour="MGAUS40"), size=1) +
-  stat_function(fun=MGAUS$MGAUS100, aes(colour="MGAUS100"), size=1) +
-  stat_function(fun=MGAUS$MGAUS180, aes(colour="MGAUS180"), size=1) +
-  stat_function(fun=MGAUS$MGAUSCUS, aes(colour="MGAUSCUS"), size=1, linetype="dashed") +
-  scale_color_discrete(limits = names(MGAUS)) +
-  xlab("travel time (minutes)") +
-  scale_x_continuous(breaks = seq(min(t_ij), max(t_ij), by = 10)) +
-  ylab("impedance weight") + 
-  scale_y_continuous(breaks = seq(0, 1, by = 0.25)) +
-  theme(legend.position = c(.95, .95),
-  legend.justification = c("right", "top"),
-  legend.title = element_blank()) +
-  labs(title = "Modified Gaussian Function")
-```
-
-The cumulative rectangular function is an isochronic measure that applies a constant weight to all opportunities reachable within some travel time window whose maximum is defined by $\bar{t}$. Although the application of a constant weight runs counter to the geographic principle of distance deterrence or decay that underpins travel behavior theory, such functions remain popular due to their ease of interpretation.
-
-```{r cumulative rectangular function, echo=FALSE}
-cumr_f = function(t_ij,t_bar){case_when(t_ij <= t_bar ~ 1,
-                                        TRUE ~ 0)}
-
-CUMR <- list(CUMR10 = function(t_ij){cumr_f(t_ij, t_bar = 10)},
-             CUMR20 = function(t_ij){cumr_f(t_ij, t_bar = 20)},
-             CUMR30 = function(t_ij){cumr_f(t_ij, t_bar = 30)},
-             CUMR40 = function(t_ij){cumr_f(t_ij, t_bar = 40)},
-             CUMRCUS = function(t_ij){cumr_f(t_ij, t_bar = 45)}) # custom - set your own parameter
-
-# plot different normalized functions
-ggplot((t_ij), aes(t_ij)) +
-  stat_function(fun=CUMR$CUMR10, aes(colour="CUMR10"), size=1) +
-  stat_function(fun=CUMR$CUMR20, aes(colour="CUMR20"), size=1) +
-  stat_function(fun=CUMR$CUMR30, aes(colour="CUMR30"), size=1) +
-  stat_function(fun=CUMR$CUMR40, aes(colour="CUMR40"), size=1) +
-  stat_function(fun=CUMR$CUMRCUS, aes(colour="CUMRCUS"), size=1, linetype="dashed") +
-  scale_color_discrete(limits = names(CUMR)) +
-  xlab("travel time (minutes)") +
-  scale_x_continuous(breaks = seq(min(t_ij), max(t_ij), by = 10)) +
-  ylab("impedance weight") + 
-  scale_y_continuous(breaks = seq(0, 1, by = 0.25)) +
-  theme(legend.position = c(.95, .95),
-  legend.justification = c("right", "top"),
-  legend.title = element_blank()) +
-  labs(title = "Cumulative Rectangular Function")
-```
-
-Finally, the cumulative linear function is a hybrid of the continuous and cumulative approaches, linearly discounting opportunities within an isochrone.
-
-```{r cumulative linear function, echo=FALSE}
-cuml_f = function(t_ij,t_bar){case_when(t_ij <= t_bar ~ 1-t_ij/t_bar,
-                                        TRUE ~ 0)}
-
-CUML <- list(CUML10 = function(t_ij){cuml_f(t_ij, t_bar = 10)},
-             CUML20 = function(t_ij){cuml_f(t_ij, t_bar = 20)},
-             CUML30 = function(t_ij){cuml_f(t_ij, t_bar = 30)},
-             CUML40 = function(t_ij){cuml_f(t_ij, t_bar = 40)},
-             CUMLCUS = function(t_ij){cuml_f(t_ij, t_bar = 45)}) # custom - set your own parameter
-
-# plot different normalized functions
-ggplot((t_ij), aes(t_ij)) +
-  stat_function(fun=CUML$CUML10, aes(colour="CUML10"), size=1) +
-  stat_function(fun=CUML$CUML20, aes(colour="CUML20"), size=1) +
-  stat_function(fun=CUML$CUML30, aes(colour="CUML30"), size=1) +
-  stat_function(fun=CUML$CUML40, aes(colour="CUML40"), size=1) +
-  stat_function(fun=CUML$CUMLCUS, aes(colour="CUMLCUS"), size=1, linetype="dashed") +
-  scale_color_discrete(limits = names(CUML)) +
-  xlab("travel time (minutes)") +
-  scale_x_continuous(breaks = seq(min(t_ij), max(t_ij), by = 10)) +
-  ylab("impedance weight") + 
-  scale_y_continuous(breaks = seq(0, 1, by = 0.25)) +
-  theme(legend.position = c(.95, .95),
-  legend.justification = c("right", "top"),
-  legend.title = element_blank()) +
-  labs(title = "Cumulative Linear Function")
-```
-
-This set of impedance functions is by no means exhaustive. Numerous alternatives have been proposed, such as the exponential-normal, exponential-square root, and log-normal functions reviewed by Reggiani et al. (2011) and the Box-Cox, Tanner, and Richards functions reviewed by Martínez and Viegas (2013). Although these functions could be implemented in future iterations of the tool, the present paper’s focus on the functions specified in Kwan (1998) introduces some of the most widely used measures of impedance in applied accessibility analysis.
-
-Kwan (1998) sets four impedance parameters for each continuous function designed to produce a weight of about 0.1 at travel times of 5, 10, 15, and 20 minutes respectively. Figure 1 recreates a figure from Kwan (1998) to visualize parameter values for the 5 functions: the inverse power function with $\beta = 2$ (POW2_0); the negative exponential function with $\beta = 0.15$ (EXP0_15); the modified Gaussian function with $\beta = 180$ (MGAUS180); and the cumulative rectangular (CUMR40) and linear (CUML40) functions with $\bar{t}$ set to 40 minutes.
-
-```{r figure1, echo=FALSE, fig.cap="\\label{fig:figure1}Figure 1. Impedance Function Comparison"}
-ggplot((t_ij), aes(t_ij)) +
-  stat_function(fun=POW$POW2_0, aes(colour="POW2_0"), size=1) +
-  stat_function(fun=NEG_EXP$EXP0_15, aes(colour="EXP0_15"), size=1, linetype="dashed") +
-  stat_function(fun=MGAUS$MGAUS180, aes(colour="MGAUS180"), size=1, linetype="dotdash") +
-  stat_function(fun=CUML$CUML40, aes(colour="CUML40"), size=1, linetype="twodash") +
-  stat_function(fun=CUMR$CUMR40, aes(colour="CUMR40"), size=1, linetype="longdash") +
-  xlab("travel time (minutes)") +
-  scale_x_continuous(breaks = seq(min(t_ij), max(t_ij), by = 10)) +
-  ylab("impedance weight") + 
-  scale_y_continuous(breaks = seq(0, 1, by = 0.25)) +
-  theme(legend.position = c(.95, .95),
-  legend.justification = c("right", "top"),
-  legend.title = element_blank()) +
-  labs(title = "Figure 1. Impedance Function Comparison")
-```
-
-Calculating place-based accessibility using the `R5R` package below requires the creation of a network dataset using data from Open Street Map (OSM) and General Transit Feed Specification (GTFS) files; input origins and destinations (point or polygon); a numerical attribute representing destination opportunities, and the selection of one or more of the 28 impedance functions implemented in the tool to weight the attractiveness of the opportunities. In addition to Kwan’s (1998) impedance specifications, the toolbox also implements Handy and Niemeier's (1997) negative exponential specification calibrated to walking trips for convenience shopping in Oakland, CA in 1980 and several additional popular cumulative rectangular measures.
 
 # DATA PROCESSING: MBTA
 ## Download and Prepare Census Data
@@ -333,57 +95,19 @@ download.file(url = "https://download.geofabrik.de/north-america/us/massachusett
               destfile = file.path(r5_path, "osm.pbf"), mode = "wb")
 ```
 
-And extract General Transit Feed Specification (GTFS) files from [Transitland](https://www.transit.land/documentation/rest-api):
-
-```{r download gtfs, include = FALSE, eval = FALSE}
-# transitland also has a feeds api that allows bounding box searches for feeds, but
-# at first glance, it will also include a lot of stuff we care less about, like peter pan buses
-
-mbta_req <- request("https://transit.land/api/v2/rest/feeds/f-drt-mbta/download_latest_feed_version") %>%
-  req_headers(apikey = transitland_key)
-mbta_resp <- req_perform(mbta_req)
-mbta_resp %>%
-  resp_body_raw() %>%
-  brio::write_file_raw(path=file.path(r5_path, "mbta_recent.zip"))
-
-# TODO: pending transitland correspondence, maybe replace them with Mobility Database
-```
-
-Or extract General Transit Feed Specification (GTFS) files from [Mobility Database](https://mobilitydatabase.org/feeds):
-
-We can download other GTFS feeds to the same location to analyze additional services.
-
-```{r extra gtfs packages, include = FALSE, eval = FALSE}
-# for bus and commuter rail you can add these by un-commenting the code
-#download.file(url = "http://web.mta.info/developers/data/lirr/google_transit.zip", 
-#              destfile = file.path(r5_path, "lirr.zip"), mode = "wb")
-#download.file(url = "http://web.mta.info/developers/data/mnr/google_transit.zip", 
-#              destfile = file.path(r5_path, "mnr.zip"), mode = "wb")
-#download.file(url = "http://web.mta.info/developers/data/nyct/bus/google_transit_bronx.zip", 
-#              destfile = file.path(r5_path, "nyct_bus_bronx.zip"), mode = "wb")
-#download.file(url = "http://web.mta.info/developers/data/nyct/bus/google_transit_brooklyn.zip", 
-#              destfile = file.path(r5_path, "nyct_bus_brooklyn.zip"), mode = "wb")
-#download.file(url = "http://web.mta.info/developers/data/nyct/bus/google_transit_manhattan.zip", 
-#              destfile = file.path(r5_path, "nyct_bus_manhattan.zip"), mode = "wb")
-#download.file(url = "http://web.mta.info/developers/data/nyct/bus/google_transit_queens.zip", 
-#              destfile = file.path(r5_path, "nyct_bus_queens.zip"), mode = "wb")
-#download.file(url = "http://web.mta.info/developers/data/nyct/bus/google_transit_staten_island.zip", 
-#              destfile = file.path(r5_path, "nyct_bus_staten.zip"), mode = "wb")
-#download.file(url = "http://web.mta.info/developers/data/busco/google_transit.zip", 
-#              destfile = file.path(r5_path, "nyc_busco.zip"), mode = "wb")
-```
-
 ## Pull MBTA GTFS metrics from LAMP
+
+To decide which dates we want to pull to represent each service change, we first calculate Quantity of Service (QoS) metrics at the route-day level from the MBTA's compressed GTFS archive, mainly so we can identify and exclude dates whose schedules have a lot of temporary shuttling (Rail Replacement Bus service, in MBTA terminology). However, the QoS metrics will be useful context for the main analysis too.
 
 ```{r}
 run_duckdb <- function(query) {
   con <- dbConnect(duckdb()) # set up duckdb connection
   
-  # load httpfs extension to query URL sources
+  # load httpfs extension to query URL sources - needed to query LAMP
   dbExecute(con, "INSTALL httpfs;")
   dbExecute(con, "LOAD httpfs;")
   
-  # load spatial extension to use geographic functions
+  # load spatial extension to use geographic functions - needed to calculate runtime distances
   dbExecute(con, "INSTALL spatial;")
   dbExecute(con, "LOAD spatial;")
   
@@ -396,6 +120,8 @@ run_duckdb <- function(query) {
   return(result)
 }
 ```
+
+SQL query to compute daily trip count, total runtime, and total runtime distance at the route-day level from the MBTA's compressed GTFS archive on LAMP
 
 ```{r}
 mbta_gtfs_metrics <- function(date_start, date_end, year) {
@@ -450,7 +176,7 @@ mbta_gtfs_metrics <- function(date_start, date_end, year) {
               , t.route_id
               , t.shape_id
               , r.route_desc
-              , min(arrival_time) as trip_start
+              , min(departure_time) as trip_start
               , max(arrival_time) as trip_end
               , 60*datepart('hour', max(departure_time)::INTERVAL - min(arrival_time)::INTERVAL)
                 + datepart('minute', max(departure_time)::INTERVAL - min(arrival_time)::INTERVAL) as trip_duration_minutes
@@ -525,6 +251,8 @@ mbta_gtfs_metrics <- function(date_start, date_end, year) {
 }
 ```
 
+Wrapper function for calculating the daily QoS metrics for any date range, even ones that span multiple years. Iterates over years because the MBTA compressed GTFS archive tables are partitioned into separate years.
+
 ```{r}
 mbta_gtfs_metrics_between <- function(date_start, date_end) {
   yyyymmdd_st <- as.integer(strftime(strptime(date_start, '%Y-%m-%d'), '%Y%m%d'))
@@ -545,6 +273,8 @@ mbta_gtfs_metrics_between <- function(date_start, date_end) {
 }
 ```
 
+Set date range and run the data pull - code may take several minutes per calendar year
+
 ```{r}
 date_start <- "2010-01-01"
 date_end <- "2025-02-01"
@@ -556,20 +286,15 @@ gtfs_metrics %>%
   write.csv(path(data_path, "mbta_gtfs_metrics_route.csv"), row.names=FALSE)
 ```
 
-## Explore MBTA GTFS metrics
+## Visualize MBTA GTFS metrics
+
+Visualize the QoS "inputs" over time which represent the context / overall service levels & trends for the period of service changes being analyzed as a case study
 
 ```{r}
 gtfs_metrics <- read.csv(path(data_path, "mbta_gtfs_metrics_route.csv"))
 ```
 
-```{r}
-gtfs_metrics %>%
-  filter(service_day %in% tuesdays, route_id == '86') %>%
-  arrange(service_day) %>%
-  head(15)
-```
-
-Identify service days with suspiciously low total runtimes
+Identify service days with suspiciously low total runtimes (likely data anomalies) to filter out in the subsequent chart.
 
 ```{r}
 sus_days <- gtfs_metrics %>%
@@ -580,6 +305,8 @@ sus_days <- gtfs_metrics %>%
   filter(total_runtime_minutes_day < 300000) %>%
   select(service_dt) %>% unique()
 ```
+
+Aggregation of SQoS metrics to the route category level
 
 ```{r}
 yyyy <- 2019
@@ -605,6 +332,8 @@ gmc <- gtfs_metrics %>%
   summarise(across(c(num_trips, total_runtime_minutes, total_runtime_km), sum), .groups='drop')
 ```
 
+Chart of total daily runtime by MBTA route category going back multiple years for Tuesdays, annotated with GLX Medford Opening and BNR Phase 1
+
 ``` {r}
 gmc %>%
   ggplot(aes(fill=route_category, y=total_runtime_minutes, x=service_dt)) +
@@ -619,44 +348,17 @@ gmc %>%
            label = 'BNR Phase 1 Opening', color='red', size=3) +
   annotate("segment", x=as.POSIXct('2024-12-15'), y=570000, yend=510000, color='red',
            arrow=arrow(type = "closed", length = unit(0.015, "npc"))) +
-  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
   labs(x='Service Date', y='Daily Minutes of Vehicle Runtime', fill='Route Category',
        title=paste0("Daily Scheduled MBTA Runtime by Route Category (Tuesdays, Jan. ",
                     as.character(yyyy), " - Jan. 2025)"))
 ```
 
-```{r}
-year <- 2024
-test_query <- paste0("
-    WITH prev_point_dists AS (
-      SELECT
-        shape_id
-        , shape_pt_lat
-        , shape_pt_lon
-        , gtfs_active_date
-        , gtfs_end_date
-        , st_distance_sphere(
-            st_point(shape_pt_lon, shape_pt_lat), 
-            st_point(lag(shape_pt_lon) over prev, lag(shape_pt_lat) over prev)
-          ) AS dist_from_prev
-      FROM read_parquet('https://performancedata.mbta.com/lamp/gtfs_archive/", year, "/shapes.parquet') 
-      WINDOW prev AS (PARTITION BY shape_id ORDER BY shape_pt_sequence)
-    )
-    
-    SELECT
-      shape_id
-      , sum(dist_from_prev) AS dist_traveled
-    FROM prev_point_dists
-    WHERE gtfs_end_date >= 20241001 AND gtfs_active_date <= 20241001
-    GROUP BY 1;
-  ")
-  
-t <- run_duckdb(test_query)
-```
+Versions of this chart with shorter x-axes were also used to identify dates before and after the MBTA service changes of interest that had minimal (or roughly equivalent) Rail Replacement Bus service. This informed the exact dates that are hard-coded into the next step.
 
 ## Create Feed Lookups & Pull MBTA GTFS full feeds
 
-First, get the MBTA GTFS feed index and create data pulling functions based on it
+Using the MBTA's GTFS feed index, create data pulling functions which will download a feed if it isn't already in the data_path but skip it if it's already there
 
 ```{r mbta gtfs}
 mbta_feed_index <- read.csv('https://cdn.mbta.com/archive/archived_feeds.txt')
@@ -687,23 +389,7 @@ feed_list <- function(dates) {
 }
 ```
 
-Option 1: get all dates for specific days of the week within a range
-
-```{r}
-date_start <- "2024-10-29"
-date_end <- "2025-02-01"
-
-# get list of dates for selected days of week before and after 12/15/2025
-dtrange <- seq(as.Date(date_start), as.Date(date_end), by="days")
-
-tuesdays <- dtrange[weekdays(dtrange) == 'Tuesday'] %>% format('%Y%m%d') %>% as.integer()
-saturdays <- dtrange[weekdays(dtrange) == 'Saturday'] %>% format('%Y%m%d') %>% as.integer()
-
-mbta_tues_lookup <- feed_list(tuesdays)
-mbta_sat_lookup <- feed_list(saturdays)
-```
-
-Option 2: define list of specific dates to analyze
+Then, define list of specific dates to analyze and pull the full GTFS feeds associated with those days.
 
 ```{r}
 mbta_changes <- list( # the comments define the effective date for each change
@@ -723,10 +409,14 @@ mbta_analysis_dates <- unique(unlist(mbta_changes))
 mbta_analysis_lookup <- feed_list(mbta_analysis_dates)
 ```
 
-# Quantity-of-service calculations (before/after)
+# Scheduled quantity of service (SQoS) calculations (before/after)
+
+Calculate the changes in SQoS that are associated with each service change
 
 ```{r}
 # this function summarizes gtfs_metrics changes for a given element of the mbta_changes list
+# also aggregates MBTA route categories and either calculates at that aggregated route
+# category level or at the individual route level, based on the by_route flag
 mbta_change_summary <- function(change_name, by_route=FALSE) {
   agg_cols <- 'route_category'
   if (by_route) agg_cols <- c('route_id', agg_cols)
@@ -777,6 +467,8 @@ mbta_change_summary <- function(change_name, by_route=FALSE) {
 }
 ```
 
+Calculate the changes in SQoS at both the route level and at the aggregated route category level
+
 ```{r}
 mbta_change_summaries_highlevel <- names(mbta_changes) %>%
   lapply(mbta_change_summary) %>%
@@ -787,29 +479,53 @@ mbta_change_summaries_routelevel <- names(mbta_changes) %>%
   `names<-`(names(mbta_changes))
 ```
 
+Look for service changes that met the MBTA's mode-level threshold for defining a "major service change" (though the aggregated route categories defined here do not actually correspond with MBTA-defined modes)
+
 ```{r}
 # this confirms that the only non-temporary service change meeting the mode threshold was BNR Phase 1,
-# and that's if you count Frequent Bus as a separate mode
+# and that's only if you count Frequent Bus as a separate mode
 mbta_change_summaries_highlevel %>%
   lapply(function(df) df %>% filter(abs(pct_chg_min) > 10))
 ```
 
+Look for service changes that met the MBTA's route-level threshold for defining a "major service change."
+
 ```{r}
-# this shows that both GLX medford and BNR Phase 1 met the route-level major change threshold, but so did:
-# - route 556 with no change in trips or distance in Winter 2025
-# - blue gaining min and orange losing min in winter 2023 beyond the threshold, seemingly unannounced
-# - though orange regained a similar amount of minutes in spring 2023
-# - 34 and 441/442 both lost more than 25% of RVH in summer 2023 cuts
-# - 714 gained >25% of min in spring 2024
-# - 4 gained >25% of min in fall 2024
-# the 34 and 441/442 changes are the ones I trust the most, but the other ones are worth an audit
 mbta_change_summaries_routelevel %>%
   lapply(function(df) df %>% filter(abs(pct_chg_min) > 25))
 ```
 
-I should have enough now to give color / interpretation of the quantity-of-service changes at least for full days. This will be a bit different from the morning peak hour changes. The only way to really filter out any "noise" would be to rerun gtfs_metrics to only pull statistics for the morning hours, but maybe the full-day statistics will be OK. 
+SQoS chart for selected routes (chosen based on above explorations)
 
-The other piece is to identify which pieces of these summaries I will actually publish. I imagine a table with each row as a change and a selection of columns for both the service changes and the access changes, and then additional color / detail in the text. Or maybe with 8 changes, I just do those as columns and allow myself to do (rapid transit, frequent bus, and other bus) * (trips, min, km). I will tack on access rows to this in the "Summary stats per change" section.
+```{r}
+yyyy <- 2022
+
+gtfs_metrics %>%
+  mutate(service_dt = as.POSIXct(strptime(as.character(service_day), '%Y%m%d'))) %>%
+  filter(route_id %in% c('34', '441442', '4'), weekdays(service_dt) == 'Tuesday', 
+         year(service_dt) >= yyyy, !(service_dt %in% sus_days$service_dt)) %>%
+  ggplot(aes(linetype=route_id, y=total_runtime_minutes, x=service_dt)) +
+  geom_line() + 
+  scale_y_continuous(labels=comma) +
+  annotate("text", x=as.POSIXct('2023-07-06'), y=1800,
+           label = 'Summer 2023', color='red', size=3) +
+  annotate("segment", x=as.POSIXct('2023-07-06'), y=1900, yend=2100, color='red',
+           arrow=arrow(type = "closed", length = unit(0.015, "npc"))) +
+  annotate("segment", x=as.POSIXct('2023-07-06'), y=1650, yend=1450, color='red',
+           arrow=arrow(type = "closed", length = unit(0.015, "npc"))) +
+  annotate("text", x=as.POSIXct('2024-08-25'), y=1200,
+           label = 'Fall 2024', color='red', size=3) +
+  annotate("segment", x=as.POSIXct('2024-08-25'), y=1100, yend=900, color='red',
+           arrow=arrow(type = "closed", length = unit(0.015, "npc"))) +
+  #theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x='Service Date', y='Daily Minutes of Vehicle Runtime', linetype='Route ID',
+       title=paste0("Daily Scheduled MBTA Runtime for Selected Routes (Tuesdays, Jan. ",
+                    as.character(yyyy), " - Jan. 2025)"))
+```
+
+These explorations give color / interpretation to the quantity-of-service changes at least for full days. The destination access calculations only consider certain times of day, but the only way to really filter out any "noise" would be to rerun gtfs_metrics to only pull statistics for those hours. Full-day statistics should be OK. 
+
+The other piece is to create a table summarizing these changes in QoS for the report. I will tack on destination access rows to thse QoS rows in the "Summary stats per change" section.
 
 ```{r}
 extract_table_info <- function(change_name) {
@@ -841,7 +557,6 @@ service_table_info <- names(mbta_change_summaries_highlevel) %>%
     factor(category, levels=c('Total', 'Rapid Transit', 'Frequent Bus', 'Other Bus')),
     desc(statistic))
 ```
-TODO: total pct chg in trips and minutes across route categories,
 
 # R5R Calculations
 
@@ -1164,7 +879,7 @@ The viz below compares the distributions of changes across scenarios. It shows t
 
 ```{r}
 # the first element of this will be plotted first (back), then the next overlaid in front of it, etc 
-adjustments_to_plot <- c('Winter 2025 (BNR Phase 1)', 'Spring 2024', 'GLX Medford Opening')
+adjustments_to_plot <- c('Winter 2025 (BNR Phase 1)', 'Spring and Summer 2023', 'GLX Medford Opening')
 #pseudolog10_breaks <- c(-1*(10^seq(1,5, by=1)), 10^seq(1,5, by=1))
 
 mbta_axs_changes %>%
@@ -1174,7 +889,7 @@ mbta_axs_changes %>%
   mutate(change_name = factor(change_name, levels=adjustments_to_plot)) %>%
   ggplot(aes(x=delta_p50)) +
   geom_vline(xintercept = 0, linetype='longdash') +
-  scale_x_continuous(label=comma, limits=c(-50000,50000)
+  scale_x_continuous(label=comma, limits=c(-100000,100000)
                      #, transform=pseudolog10_trans, breaks=pseudolog10_breaks
                      ) +
   
@@ -1186,7 +901,7 @@ mbta_axs_changes %>%
   geom_freqpoly(
     aes(weight=total_pop, group=change_name),
     alpha=0.5, stat = "bin", binwidth=1000) +
-  labs(x='Change in Jobs Accessible', y='Affected Population', fill='Adjustment Name',
+  labs(x='Change in Jobs Reachable within 60 Minutes via Transit + Walking \nStarting from 7:30am-8:00am (Median Departure Timing)', y='Affected Population', fill='Service Change Name',
        title='Job Access Change Distributions (Absolute) per Service Change') +
   scale_y_continuous(label=comma)
 
@@ -1249,10 +964,9 @@ I also tried graphing the changes in population per access bin for a given chang
 
 ### Summary stats per change
 
-TODO: look into statistics that would capture different kinds of distributions, which I could report alongside the total number of affected population
-
 TODO: 
-- add total affected pop & avg or total change in access per pre-existing access bin (not population ntile)
+- p15-p85 swings before and after per block
+- max or p99 change in axs per service change
 
 ```{r}
 access_table_info <- mbta_axs_changes %>%
@@ -1312,6 +1026,8 @@ service_table_info %>%
   bind_rows(access_table_info) %>%
   write.csv(paste0(outputs_path, '/summary_table.csv'), row.names=F)
 ```
+
+TODO: quadrant or other viz of chg axs vs chg in tod ptile swing of axs ("consistency"?)
 
 ### Demographic breakdown visualizations
 
@@ -1382,21 +1098,37 @@ axs_chgs_raceethn_aovs <- mbta_axs_changes %>%
   map(function(df) {aov(delta_p50 ~ race, data=df, weights=df$pop)})
 ```
 
+ANOVA analyses
+
 ```{r}
-axs_chgs_raceethn_aovs %>%
-  map(summary)
+aov_table <- axs_chgs_raceethn_aovs %>%
+  map(tidy) %>%
+  bind_rows(.id='id') %>%
+  arrange(by=factor(id, levels=names(mbta_changes)))
 ```
 
-Tukey post-hoc tests - many significant differences between groups in the mean deltas, but relatively small ones, at least at first glance, relative to the mean befores
+```{r}
+aov_table %>%
+  write.csv(path(outputs_path, "anova_results.csv"), row.names=F)
+```
+
+Tukey post-hoc tests 
 
 ```{r}
-axs_chgs_raceethn_aovs %>%
-  map(TukeyHSD)
+tukey_table <- axs_chgs_raceethn_aovs %>%
+  map(TukeyHSD) %>%
+  map(tidy) %>%
+  bind_rows(.id='id') %>%
+  arrange(by=factor(id, levels=names(mbta_changes)))
+```
+
+```{r}
+tukey_table %>%
+  write.csv(path(outputs_path, "tukey_results.csv"), row.names=F)
 ```
 
 ### Maps & Spatial Analysis
 
-TODO: plot delta_p50==0 separately with just outlines
 TODO: map of snapshot access
 TODO: map of change in 15-to-85 range
 
@@ -1412,6 +1144,8 @@ sf_delta_axs <- origins_i_sf %>%
   mutate(delta_p50 = case_when(delta_p50 == 0 ~ NA, .default=delta_p50))
 ```
 
+Facet map of changes in access:
+
 ``` {r}
 tm_shape(sf_delta_axs) +
   tm_polygons(fill = 'delta_p50',  
@@ -1426,7 +1160,9 @@ tm_shape(sf_delta_axs) +
   tm_layout(frame = FALSE,
             bg.color = "grey85",
             legend.outside = TRUE
-            )
+            ) #+
+  # tm_title("Changes in jobs reachable in 60 min. via transit per census block for 50th 
+  # \npercentile departure times from 7:30-8:00am on Tuesdays, Dec. 2022 to Jan. 2025")
 ```
 
 TODO: decide on adding spatial autocorrelation or other statistics to aggregate_axs()
@@ -1469,6 +1205,8 @@ TODO: directly plot the change in 15-85 range over time (try absolute & pct)
 
 ```{r}
 metric <- 'popmean'
+svcchg_label_color <- 'red'
+ptile_label_color <- 'black'
 
 axs_agg %>%
   mutate(service_date = as.POSIXct(strptime(as.character(service_day), '%Y%m%d'))) %>%
@@ -1480,10 +1218,27 @@ axs_agg %>%
         ymax=get(paste0('total_emp_p30_', metric)), 
         ymin=get(paste0('total_emp_p70_', metric))
         ), alpha=0.2) +
-  scale_y_continuous(labels=comma) +
+  scale_y_continuous(labels=comma, limits=c(0,190000)) +
+  annotate("text", x=as.POSIXct('2023-02-12'), y=100000,
+           label = 'GLX Medford Opening', color=svcchg_label_color, size=3) +
+  annotate("segment", x=as.POSIXct('2022-12-10'), y=105000, yend=150000, color=svcchg_label_color,
+           arrow=arrow(type = "closed", length = unit(0.015, "npc"))) +
+  annotate("text", x=as.POSIXct('2024-01-12'), y=126000,
+           label = '70', color=ptile_label_color, size=3) +
+  annotate("text", x=as.POSIXct('2024-01-12'), y=148000,
+           label = '50', color=ptile_label_color, size=3) +
+  annotate("text", x=as.POSIXct('2024-01-12'), y=165000,
+           label = '30', color=ptile_label_color, size=3) +
+    annotate("text", x=as.POSIXct('2023-10-12'), y=175000,
+           label = 'Departure Timing Percentiles:', color=ptile_label_color, size=3) +
+  annotate("text", x=as.POSIXct('2024-10-15'), y=100000,
+           label = 'BNR Phase 1 Opening', color=svcchg_label_color, size=3) +
+  annotate("segment", x=as.POSIXct('2024-12-15'), y=105000, yend=140000, color=svcchg_label_color,
+           arrow=arrow(type = "closed", length = unit(0.015, "npc"))) +
   labs(
-    title="Job Accessibility via Transit for Average MBTA-Area Resident",
-    y = "Jobs Accessible via Transit & Walking within 60 Minutes", x="Tuesdays"
+    #title="Job Accessibility via Transit & Walking for Average MBTA-Area Resident",
+    y = "Jobs Reachable within 60 Minutes Starting from 7:30am-8:00am", 
+    x="Service Date (Tuesdays)"
   )
   
 ```
