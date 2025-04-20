@@ -23,7 +23,6 @@ library(fs) # for file path operations
 library(r5r) # for calculating travel time matrices over transportation networks
 library(sf) # for geospatial data processing
 library(tmap) # for mapping
-library(viridis)
 library(progress) # for progress bars
 library(arrow) # for batched read + write + transform of parquet files on disk
 library(duckdb) # for querying MBTA LAMP
@@ -41,7 +40,8 @@ ttm_path <- dir_create("./r5_ttm") # for storing od matrix
 r5_path <- dir_create("./r5_graph") # for the r5 network graph
 ```
 
-# DATA PROCESSING: MBTA
+# Data Pulling and Pre-Processing
+
 ## Download and Prepare Census Data
 
 The first step is to download the census data that will be used as indicators of opportunities, including census population and employment data at the block level using the `tigris` and `lodes` packages.
@@ -97,7 +97,7 @@ download.file(url = "https://download.geofabrik.de/north-america/us/massachusett
 
 ## Pull MBTA GTFS metrics from LAMP
 
-To decide which dates we want to pull to represent each service change, we first calculate Quantity of Service (QoS) metrics at the route-day level from the MBTA's compressed GTFS archive, mainly so we can identify and exclude dates whose schedules have a lot of temporary shuttling (Rail Replacement Bus service, in MBTA terminology). However, the QoS metrics will be useful context for the main analysis too.
+To decide which dates we want to pull to represent each service change, we first calculate scheduled quantity of service (SQoS) metrics at the route-day level from the MBTA's compressed GTFS archive, mainly so we can identify and exclude dates whose schedules have a lot of temporary shuttling (Rail Replacement Bus service, in MBTA terminology). However, the SQoS metrics will be useful context for the main analysis too.
 
 ```{r}
 run_duckdb <- function(query) {
@@ -251,7 +251,7 @@ mbta_gtfs_metrics <- function(date_start, date_end, year) {
 }
 ```
 
-Wrapper function for calculating the daily QoS metrics for any date range, even ones that span multiple years. Iterates over years because the MBTA compressed GTFS archive tables are partitioned into separate years.
+Wrapper function for calculating the daily SQoS metrics for any date range, even ones that span multiple years. Iterates over years because the MBTA compressed GTFS archive tables are partitioned into separate years.
 
 ```{r}
 mbta_gtfs_metrics_between <- function(date_start, date_end) {
@@ -288,13 +288,13 @@ gtfs_metrics %>%
 
 ## Visualize MBTA GTFS metrics
 
-Visualize the QoS "inputs" over time which represent the context / overall service levels & trends for the period of service changes being analyzed as a case study
+Visualize the SQoS "inputs" over time which represent the context / overall service levels & trends for the period of service changes being analyzed as a case study
 
 ```{r}
 gtfs_metrics <- read.csv(path(data_path, "mbta_gtfs_metrics_route.csv"))
 ```
 
-Identify service days with suspiciously low total runtimes (likely data anomalies) to filter out in the subsequent chart.
+Identify service days with suspiciously low total runtimes (likely data anomalies) to filter out in the subsequent charts.
 
 ```{r}
 sus_days <- gtfs_metrics %>%
@@ -354,7 +354,7 @@ gmc %>%
                     as.character(yyyy), " - Jan. 2025)"))
 ```
 
-Versions of this chart with shorter x-axes were also used to identify dates before and after the MBTA service changes of interest that had minimal (or roughly equivalent) Rail Replacement Bus service. This informed the exact dates that are hard-coded into the next step.
+Versions of this chart over shorter date ranges were also used to identify dates before and after the MBTA service changes of interest that had minimal (or roughly equivalent) Rail Replacement Bus service. This informed the exact dates that are hard-coded into the next step.
 
 ## Create Feed Lookups & Pull MBTA GTFS full feeds
 
@@ -507,6 +507,7 @@ gtfs_metrics %>%
   ggplot(aes(linetype=route_id, y=total_runtime_minutes, x=service_dt)) +
   geom_line() + 
   scale_y_continuous(labels=comma) +
+  ylim(0,3200) +
   annotate("text", x=as.POSIXct('2023-07-06'), y=1800,
            label = 'Summer 2023', color='red', size=3) +
   annotate("segment", x=as.POSIXct('2023-07-06'), y=1900, yend=2100, color='red',
@@ -518,14 +519,14 @@ gtfs_metrics %>%
   annotate("segment", x=as.POSIXct('2024-08-25'), y=1100, yend=900, color='red',
            arrow=arrow(type = "closed", length = unit(0.015, "npc"))) +
   #theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
-  labs(x='Service Date', y='Daily Minutes of Vehicle Runtime', linetype='Route ID',
+  labs(x='Service Date', y='Daily Minutes of Vehicle Runtime', linetype='Bus Route',
        title=paste0("Daily Scheduled MBTA Runtime for Selected Routes (Tuesdays, Jan. ",
                     as.character(yyyy), " - Jan. 2025)"))
 ```
 
 These explorations give color / interpretation to the quantity-of-service changes at least for full days. The destination access calculations only consider certain times of day, but the only way to really filter out any "noise" would be to rerun gtfs_metrics to only pull statistics for those hours. Full-day statistics should be OK. 
 
-The other piece is to create a table summarizing these changes in QoS for the report. I will tack on destination access rows to thse QoS rows in the "Summary stats per change" section.
+The other piece is to create a table summarizing these changes in SQoS for the report. I will tack on destination access rows to these SQoS rows in the "Summary stats per change" section.
 
 ```{r}
 extract_table_info <- function(change_name) {
@@ -657,7 +658,7 @@ opportunities_j <- destinations_j %>%
 
 ## Calculate Origin-Destination Travel Time Matrices
 
-Third, an origin-destination matrix is calculated for each service date in accordance with the travel and batching parameters set earlier. In this case, I have set the ODCM to save to disk as a parquet dataset, which is a great format for compressed storage and for larger-than-memory calculations. This process took about 35 minutes per date for MBTA blocks (n=~80k).
+Calculate an origin-destination matrix for each service date in accordance with the travel and batching parameters set earlier. In this case, I have set the ODCM to save to disk as a parquet dataset, which is a great format for compressed storage and for larger-than-memory calculations. This process took about 35 minutes per date for MBTA blocks (n=~80k).
 
 ```{r}
 lookup <- mbta_analysis_lookup
@@ -728,19 +729,7 @@ for (i in 1:length(lookup)) {
 
 ## Calculate Accessibility
 
-Finally, accessibilities are calculated using the selected impedance function(s) by iterating over all the batches of the origin-destination matrix per service date. There's a few ways of doing this.
-
-TODO: try generating some of the accessibility outputs shown here: https://cran.r-project.org/web/packages/r5r/vignettes/accessibility.html
-
-TODO: parameterize ttm_path
-TODO: decide on data storage for access datasets
-maybe /outputs -> (optional layers for agency, metric type, etc) -> csv per feed day?
-
-The visualization I think I want next is a line chart with shaded areas representing the high and low percentage bounds of accessibility and dates on the x axis. To do that, I need to calculate accessibility from each ttm and then aggregate that, starting with just the population average or median but likely expanding to a bunch of different metrics at some point (grabbing a set of accessibility percentiles - distinct from within-window percentiles, grouping by population, calculating gini / palma / concentration indices for inequality, etc). There's also the calculation of before/after changes in access per block, but that kind of visualization will be limited to just examples since we're interested in lots of little changes. 
-
-How can I measure if a schedule change makes the time-of-day percentiles less variable? Because what if there are changes for some people, but not for the median person? A given block could see higher accessibility levels but the same, smaller, or greater range of time-of-day accessibility values, either in absolute terms or relative to its level. That may be another example map worth creating, but for this study again I'll need to abstract or aggregate that a bit more. Probably at first just by calculating the population average for each time-of-day percentile and then comparing the spreads over time. 
-
-I'm realizing that there is a large rabbit hole of possible metrics here, even in this, my initial test run. 
+Functions for calculating destination access by summing up the opportunities (jobs, in this case) within the destinations that are reachable from each origin.
 
 ```{r}
 lud <- mbta_cb_poly %>%
@@ -783,7 +772,7 @@ axs_window_percentiles <- function(ttm, feed_day) {
 }
 ```
 
-Read the travel time matrices for a set of dates and calculate accessibility per percentile. This cell took ~2min per date for MBTA blocks (n=~80k).  
+Read the OD travel time matrices for a set of dates, calculate accessibility per percentile, and save the results. This cell took ~2min per date for MBTA blocks (n=~80k).  
 
 ```{r}
 for (feed_day in names(mbta_analysis_lookup)) {
@@ -809,7 +798,7 @@ axs_dfs <- names(mbta_analysis_lookup) %>%
   `names<-`(names(mbta_analysis_lookup))
 ```
 
-Get race/ethn data, clean it, and join it in
+Get race/ethnicity data per origin, clean it, and join it in.
 
 ```{r}
 ma_blocks_raceethn <- read.csv(paste0(data_path, '/raceethn_2020_block_MA.csv'))
@@ -834,7 +823,7 @@ axs_all <- axs_dfs %>%
   inner_join(block_pops, by='id')
 ```
 
-Create dataframes of the before-and-after for each change
+Create dataframes of the before-and-after of destination access for each service change
 
 ```{r}
 # for each mbta_change to consider, create a before and after and then stack?
@@ -875,7 +864,7 @@ mbta_axs_changes <- names(mbta_changes) %>%
 
 ### Compare distributions of access changes
 
-The viz below compares the distributions of changes across scenarios. It shows that most of the distributions are quite similar, with all but GLX Medford Opening having a mix of winners and losers with tails leaning in the direction of the service changes.  I'm not sure if any of these will make it into the final paper, given that the untransformed-axis charts make it hard to compare across adjustments, while the transformed-axis charts imply a bimodal distribution that isn't really there. 
+The viz below compares the distributions of changes across scenarios. It shows that most of the distributions are quite similar, with all but GLX Medford Opening having a mix of winners and losers with tails leaning in the direction of the service changes.  The untransformed-axis charts make it a little hard to compare across adjustments, but transforming the x-axis implies a bimodal distribution that isn't really there. 
 
 ```{r}
 # the first element of this will be plotted first (back), then the next overlaid in front of it, etc 
@@ -889,6 +878,7 @@ mbta_axs_changes %>%
   mutate(change_name = factor(change_name, levels=adjustments_to_plot)) %>%
   ggplot(aes(x=delta_p50)) +
   geom_vline(xintercept = 0, linetype='longdash') +
+  scale_fill_manual(values=c('#27b376', '#bf212f', '#264b96')) +
   scale_x_continuous(label=comma, limits=c(-100000,100000)
                      #, transform=pseudolog10_trans, breaks=pseudolog10_breaks
                      ) +
@@ -923,6 +913,7 @@ mbta_axs_changes %>%
   ggplot() + 
   geom_col(aes(x=access_bin_before_p50, y=chg_personjob_access, fill=as.factor(change_name)),
            alpha=.5, position='identity') +
+  scale_fill_manual(values=c('#27b376', '#bf212f', '#264b96')) +
   scale_x_continuous(label=comma) + 
   scale_y_continuous(label=comma) +
   labs(x='Pre-Adjustment Jobs Accessible', 
@@ -964,9 +955,7 @@ I also tried graphing the changes in population per access bin for a given chang
 
 ### Summary stats per change
 
-TODO: 
-- p15-p85 swings before and after per block
-- max or p99 change in axs per service change
+Befores, afters, and deltas of average job access for each race/ethn group and each departure timing percentile per service change
 
 ```{r}
 access_table_info <- mbta_axs_changes %>%
@@ -1021,22 +1010,22 @@ access_table_info <- mbta_axs_changes %>%
   select(category, statistic, all_of(names(mbta_changes)))
 ```
 
+combine the SQoS summary with the access summary and save to csv
+
 ```{r}
 service_table_info %>%
   bind_rows(access_table_info) %>%
   write.csv(paste0(outputs_path, '/summary_table.csv'), row.names=F)
 ```
 
-TODO: quadrant or other viz of chg axs vs chg in tod ptile swing of axs ("consistency"?)
+Future idea: quadrant or other viz of chg axs vs chg in tod ptile swing of axs ("consistency"?)
 
 ### Demographic breakdown visualizations
 
-average change in job access per demographic group by adjustment. can graph before or after instead to get differences in average existing access
-
-TODO: version by white/nonwhite only to reflect Title VI requirement; clean up axes
+average change in job access per demographic group by svc change. can graph before or after instead to get differences in average existing access
 
 ```{r}
-mbta_axs_changes %>%
+avg_changes_raceethn <- mbta_axs_changes %>%
   mutate(change_name = factor(change_name, levels=names(mbta_changes))) %>%
   pivot_longer(
     cols=c(non_white, # OPTION 1: combine all non-white
@@ -1056,13 +1045,45 @@ mbta_axs_changes %>%
   # ) %>% 
   group_by(change_name, race) %>%
   summarise(
+    mean_axs_b4 = wtd.mean(before_p50, weights=pop),
     mean_axs = wtd.mean(delta_p50, weights=pop),
     stderr_axs = sqrt(wtd.var(delta_p50, weights=pop))/sqrt(sum(pop)),
-    .gruops='drop'
-    ) %>%
+    .groups='drop'
+    ) 
+```
+
+Calculate ratios of percent changes in access for protected vs nonprotected populations and compare with MBTA thresholds for defining disparate impacts
+
+```{r}
+pct_delta_comparison <- avg_changes_raceethn %>%
+  pivot_wider(id_cols='change_name', names_from='race', values_from=c('mean_axs_b4', 'mean_axs')) %>%
+  mutate(
+    pct_delta_protected = `mean_axs_Non-white (or Hispanic of any race)` / 
+      `mean_axs_b4_Non-white (or Hispanic of any race)`,
+    pct_delta_nonprotected = `mean_axs_White (non-Hispanic)` / `mean_axs_b4_White (non-Hispanic)`,
+    ratio_pct_delta = pct_delta_protected / pct_delta_nonprotected,
+    disparate = case_when(
+      pct_delta_protected < 0 & ratio_pct_delta > 1.2 ~ T,
+      pct_delta_protected > 0 & ratio_pct_delta < 0.8 ~ T,
+      .default = F
+    ),
+    .keep='unused'
+  )
+```
+
+```{r}
+pct_delta_comparison %>%
+  write.csv(path(outputs_path, "pct_delta_comparison.csv"), row.names=F)
+```
+
+Chart of average absolute changes in job access per population per service change
+
+``` {r}
+avg_changes_raceethn %>%
   ggplot(aes(fill=race, x=race, y=mean_axs)) + 
   geom_bar(position='dodge', stat='identity') +
   scale_y_continuous(labels=comma) +
+  scale_fill_manual(values=c("#156082", '#FFC000')) +
   geom_hline(yintercept=0, linewidth=0.2) +
   #geom_bar(position=position_dodge(width=0.9)) +
   geom_errorbar(aes(ymax=mean_axs + stderr_axs, ymin = mean_axs - stderr_axs), 
@@ -1129,31 +1150,31 @@ tukey_table %>%
 
 ### Maps & Spatial Analysis
 
-TODO: map of snapshot access
-TODO: map of change in 15-to-85 range
-
-These tmap maps are useful for me as an exploration of various mappable metrics, but I'd rather just export to QGIS to make polished maps for publication rather than try to do it all here.
+Prepare spatial data with the changes in median-percentile job access per origin
 
 ```{r}
 sf_delta_axs <- origins_i_sf %>%
   mutate(id = as.numeric(id)) %>%
   inner_join(mbta_axs_changes, by='id') %>%
+  # # uncomment to filter out some of the service changes to reduce the number of facets
+  # filter(!(change_name %in% c('Winter 2023', 'Spring 2024'))) %>%
   mutate(change_name=factor(change_name, levels=names(mbta_changes))) %>%
   group_by(id) %>%
   filter(sum(abs(delta_p50)) > 0) %>%
-  mutate(delta_p50 = case_when(delta_p50 == 0 ~ NA, .default=delta_p50))
+  mutate(delta_p50 = case_when(delta_p50 == 0 ~ NA, .default=delta_p50)) 
 ```
 
-Facet map of changes in access:
+Facet map of changes in access per origin per service change:
 
 ``` {r}
-tm_shape(sf_delta_axs) +
+sf_delta_axs %>%
+  tm_shape() +
   tm_polygons(fill = 'delta_p50',  
           fill.scale = tm_scale_continuous_pseudo_log(
             values='brewer.prgn', values.range = c(0, 1), base=2, sigma=20000,
             value.na = 'grey75', label.na = "Gray = Zero Change",
             ticks = c(-300000, -30000, 0, 30000, 300000)
-            ), # rd_yl_gn
+            ), # brewer.rd_yl_gn for red/yellow/green, brewer.prgn for purple/green
           fill.legend = tm_legend("Change in Job Access", reverse=TRUE, item.height=5),
           col_alpha = 0) +
   tm_facets("change_name", scale.factor=3) +
@@ -1165,13 +1186,12 @@ tm_shape(sf_delta_axs) +
   # \npercentile departure times from 7:30-8:00am on Tuesdays, Dec. 2022 to Jan. 2025")
 ```
 
-TODO: decide on adding spatial autocorrelation or other statistics to aggregate_axs()
+Future idea: map of change in 15-to-85 range
+Future idea: spatial autocorrelation or other statistics
 
 ### Summary stats across dates
 
-TODO: add summary statistics of social and geographic equity
-- then, group befores, afters, and changes by race/ethn and do stderr / anova / tukey
-- then add gini & palma to aggregate_axs()
+population-weighted average job access per service change, per departure timing percentile, and per race/ethn group
 
 ```{r}
 aggregate_axs <- function(df) {
@@ -1195,13 +1215,15 @@ aggregate_axs <- function(df) {
 }
 ```
 
+Future idea: calculate gini & palma indices
+
 ```{r}
 axs_agg <- axs_dfs %>%
   lapply(aggregate_axs) %>%
   bind_rows()
 ```
 
-TODO: directly plot the change in 15-85 range over time (try absolute & pct)
+Plot line of avg job access with departure timing variability around it
 
 ```{r}
 metric <- 'popmean'
@@ -1243,4 +1265,4 @@ axs_agg %>%
   
 ```
 
-The reason 20230627 is so much lower than 20230321 seems to be the Red Line shuttling from Braintree to South Station that occurred on the former date, which was lifted for 20230711 but simultaneously replaced by a bunch of bus frequency cuts.
+The reason 20230627 is so much lower than 20230321 seems to be the Red Line shuttling from Braintree to South Station that occurred on the former date, which was lifted for 20230711 but simultaneously replaced by a bunch of bus frequency cuts. 
