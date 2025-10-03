@@ -501,8 +501,9 @@ SQoS chart for selected routes (chosen based on above explorations)
 yyyy <- 2022
 
 gtfs_metrics %>%
-  mutate(service_dt = as.POSIXct(strptime(as.character(service_day), '%Y%m%d'))) %>%
-  filter(route_id %in% c('34', '441442', '4'), weekdays(service_dt) == 'Tuesday', 
+  mutate(service_dt = as.POSIXct(strptime(as.character(service_day), '%Y%m%d')),
+         route_id = case_match(route_id, '441442' ~ '441/442', .default=route_id)) %>%
+  filter(route_id %in% c('34', '441/442', '4'), weekdays(service_dt) == 'Tuesday', 
          year(service_dt) >= yyyy, !(service_dt %in% sus_days$service_dt)) %>%
   ggplot(aes(linetype=route_id, y=total_runtime_minutes, x=service_dt)) +
   geom_line() + 
@@ -1166,8 +1167,18 @@ sf_delta_axs <- origins_i_sf %>%
 
 Facet map of changes in access per origin per service change:
 
-``` {r}
+``` {r, fig.width=6, fig.height=6}
 sf_delta_axs %>%
+  filter(!(change_name %in% c('Winter 2023', 'Spring 2024'))) %>%
+  mutate(change_name = case_match(
+    change_name, 'Spring and Summer 2023' ~ 'Spring & Summer 2023', 
+    'Winter 2025 (BNR Phase 1)' ~ 'Winter 2025 (BNR Ph. 1)', .default=change_name
+    ), 
+    change_name = factor(
+      change_name, levels=c('GLX Medford Opening', 'Spring & Summer 2023', 'Fall 2023', 
+                            'Summer 2024', 'Fall 2024', 'Winter 2025 (BNR Ph. 1)')
+      )
+  ) %>%
   tm_shape() +
   tm_polygons(fill = 'delta_p50',  
           fill.scale = tm_scale_continuous_pseudo_log(
@@ -1177,7 +1188,7 @@ sf_delta_axs %>%
             ), # brewer.rd_yl_gn for red/yellow/green, brewer.prgn for purple/green
           fill.legend = tm_legend("Change in Job Access", reverse=TRUE, item.height=5),
           col_alpha = 0) +
-  tm_facets("change_name", scale.factor=3) +
+  tm_facets("change_name", scale.factor=3, nrow=3) +
   tm_layout(frame = FALSE,
             bg.color = "grey85",
             legend.outside = TRUE
