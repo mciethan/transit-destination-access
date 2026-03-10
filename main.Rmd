@@ -335,7 +335,7 @@ gmc <- gtfs_metrics %>%
 Chart of total daily runtime by MBTA route category going back multiple years for Tuesdays, annotated with GLX Medford Opening and BNR Phase 1
 
 ``` {r}
-gmc %>%
+sched_plot <- gmc %>%
   ggplot(aes(fill=route_category, y=total_runtime_minutes, x=service_dt)) +
   geom_bar(position="stack", stat="identity") + 
   scale_y_continuous(labels=comma) +
@@ -351,7 +351,10 @@ gmc %>%
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
   labs(x='Service Date', y='Daily Minutes of Vehicle Runtime', fill='Route Category',
        title=paste0("Daily Scheduled MBTA Runtime by Route Category (Tuesdays, Jan. ",
-                    as.character(yyyy), " - Jan. 2025)"))
+                    as.character(yyyy), " - Jan. 2025)")) 
+
+#ggsave(path(outputs_path,'sched_mbta_runtime.svg'), sched_plot, width=11, height=6, units='in')
+sched_plot
 ```
 
 Versions of this chart over shorter date ranges were also used to identify dates before and after the MBTA service changes of interest that had minimal (or roughly equivalent) Rail Replacement Bus service. This informed the exact dates that are hard-coded into the next step.
@@ -1080,7 +1083,7 @@ pct_delta_comparison %>%
 Chart of average absolute changes in job access per population per service change
 
 ``` {r}
-avg_changes_raceethn %>%
+avg_changes_raceethn_plot <- avg_changes_raceethn %>%
   ggplot(aes(fill=race, x=race, y=mean_axs)) + 
   geom_bar(position='dodge', stat='identity') +
   scale_y_continuous(labels=comma) +
@@ -1094,6 +1097,12 @@ avg_changes_raceethn %>%
   theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(),
         legend.position = "top") +
   facet_wrap(vars(change_name))
+
+avg_changes_raceethn_plot
+```
+
+```{r}
+ggsave(path(outputs_path,'avg_changes_raceethn.svg'), avg_changes_raceethn_plot, width = 11, height=6)
 ```
 
 ### Statistical tests for race & ethnicity
@@ -1168,7 +1177,7 @@ sf_delta_axs <- origins_i_sf %>%
 Facet map of changes in access per origin per service change:
 
 ``` {r, fig.width=6, fig.height=6}
-sf_delta_axs %>%
+chgAxs_facetMap <- sf_delta_axs %>%
   filter(!(change_name %in% c('Winter 2023', 'Spring 2024'))) %>%
   mutate(change_name = case_match(
     change_name, 'Spring and Summer 2023' ~ 'Spring & Summer 2023', 
@@ -1195,6 +1204,12 @@ sf_delta_axs %>%
             ) #+
   # tm_title("Changes in jobs reachable in 60 min. via transit per census block for 50th 
   # \npercentile departure times from 7:30-8:00am on Tuesdays, Dec. 2022 to Jan. 2025")
+
+chgAxs_facetMap
+```
+
+```{r}
+tmap_save(chgAxs_facetMap, path(outputs_path,'chg_access_facetmap.jpg'), width=6, height=6, units='in')
 ```
 
 Future idea: map of change in 15-to-85 range
